@@ -1,0 +1,16 @@
+Package: dsVault
+Title: DataSHIELD Vault API Client
+Version: 0.0.0.9000
+Authors@R:
+    c(person("David", "Sarrat González", , "david.sarrat@isglobal.org", role = c("aut", "cre")),
+      person("Juan R", "González", , "juanr.gonzalez@isglobal.org", role = c("aut")))
+Description: R client for interacting with DataSHIELD Vault Collections API.
+    Provides functions to list objects, get hashes, and download files
+    from a vault collection.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3
+Imports:
+    httr2,
+    R6
