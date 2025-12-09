@@ -24,10 +24,16 @@ var dsVault = {
           "type": "array",
           "items": [
             {
-              "key": "endpoint",
+              "key": "host",
               "type": "string",
-              "title": "Vault Endpoint URL",
-              "description": "The base URL of the DataSHIELD Vault API (e.g., http://vault.example.org:8000)"
+              "title": "Host",
+              "description": "The hostname or IP address of the Vault API"
+            },
+            {
+              "key": "port",
+              "type": "integer",
+              "title": "Port",
+              "description": "The port number of the Vault API"
             },
             {
               "key": "collection",
@@ -36,7 +42,7 @@ var dsVault = {
               "description": "The name of the collection in the vault"
             }
           ],
-          "required": ["endpoint", "collection"],
+          "required": ["host", "port", "collection"],
         },
         "credentials": {
           "$schema": "http://json-schema.org/schema#",
@@ -45,7 +51,7 @@ var dsVault = {
             {
               "key": "apikey",
               "type": "string",
-              "title": "Collection API Key",
+              "title": "Vault Key",
               "format": "password",
               "description": "The API key for accessing the collection"
             }
@@ -59,7 +65,7 @@ var dsVault = {
     var toVaultResource = function(name, params, credentials) {
       return {
         name: name,
-        url: params.endpoint + "/collection/" + params.collection,
+        url: "http://" + params.host + ":" + params.port + "/collection/" + params.collection,
         format: "dsvault.collection",
         identity: params.collection,
         secret: credentials.apikey
