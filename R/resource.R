@@ -72,6 +72,16 @@ VaultResourceClient <- R6::R6Class(
     },
 
     #' @description
+    #' Get the resource value (DSVaultCollection object)
+    #' This method is called by resourcer::as.resource.object()
+    #'
+    #' @param ... Additional arguments (ignored)
+    #' @return A DSVaultCollection object
+    getValue = function(...) {
+      self$getConnection()
+    },
+
+    #' @description
     #' List all objects in the collection
     #'
     #' @return Character vector of object names
