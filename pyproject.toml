@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dsimaging-admin"
+version = "0.1.0"
+description = "Admin CLI for managing medical imaging datasets in S3/MinIO for DataSHIELD"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [
+    { name = "David Sarrat Gonzalez", email = "david.sarrat@isglobal.org" },
+    { name = "Juan R Gonzalez", email = "juanr.gonzalez@isglobal.org" },
+]
+keywords = ["datashield", "medical-imaging", "minio", "s3", "dicom", "radiomics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Healthcare Industry",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "boto3>=1.28.0",
+    "pyarrow>=14.0.0",
+    "pyyaml>=6.0",
+    "click>=8.0.0",
+]
+
+[project.scripts]
+dsimaging-admin = "dsimaging_admin.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/dsFlower/dsimaging-admin"
+Repository = "https://github.com/dsFlower/dsimaging-admin"
