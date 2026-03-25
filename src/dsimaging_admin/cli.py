@@ -14,31 +14,82 @@ from .manifest import (
 )
 
 
-def _default(envvar: str, fallback: str) -> str:
-    return os.environ.get(envvar, fallback)
+CONFIG_PATH = os.path.expanduser("~/.dsimaging.yaml")
+
+
+def _load_config() -> dict:
+    """Load config from ~/.dsimaging.yaml if it exists."""
+    if not os.path.exists(CONFIG_PATH):
+        return {}
+    try:
+        import yaml
+        with open(CONFIG_PATH) as f:
+            data = yaml.safe_load(f) or {}
+        return data.get("default", data)
+    except Exception:
+        return {}
+
+
+def _default(envvar: str, config_key: str, fallback: str) -> str:
+    """Resolve: env var > config file > hardcoded fallback."""
+    val = os.environ.get(envvar, "")
+    if val:
+        return val
+    cfg = _load_config()
+    val = cfg.get(config_key, "")
+    if val:
+        return str(val)
+    return fallback
 
 
 @click.group()
 @click.version_option(__version__)
-@click.option("--endpoint", default=_default("DSIMAGING_ENDPOINT", "http://127.0.0.1:9000"),
+@click.option("--endpoint", default=_default("DSIMAGING_ENDPOINT", "endpoint", "http://127.0.0.1:9000"),
               help="S3/MinIO endpoint URL")
-@click.option("--access-key", default=_default("DSIMAGING_ACCESS_KEY", "minioadmin"),
+@click.option("--access-key", default=_default("DSIMAGING_ACCESS_KEY", "access_key", "minioadmin"),
               help="S3 access key")
-@click.option("--secret-key", default=_default("DSIMAGING_SECRET_KEY", "minioadmin123"),
+@click.option("--secret-key", default=_default("DSIMAGING_SECRET_KEY", "secret_key", "minioadmin123"),
               help="S3 secret key")
-@click.option("--bucket", default=_default("DSIMAGING_BUCKET", "imaging-data"),
+@click.option("--bucket", default=_default("DSIMAGING_BUCKET", "bucket", "imaging-data"),
               help="S3 bucket name")
-@click.option("--region", default=_default("DSIMAGING_REGION", ""),
+@click.option("--region", default=_default("DSIMAGING_REGION", "region", ""),
               help="S3 region (empty for MinIO)")
 @click.pass_context
 def main(ctx, endpoint, access_key, secret_key, bucket, region):
-    """Admin CLI for managing medical imaging datasets in S3/MinIO."""
+    """Admin CLI for managing medical imaging datasets in S3/MinIO.
+
+    Configuration priority: CLI flags > environment variables > ~/.dsimaging.yaml
+    """
     ctx.ensure_object(dict)
     ctx.obj["s3"] = create_client(endpoint, access_key, secret_key, region)
     ctx.obj["bucket"] = bucket
     ctx.obj["endpoint"] = endpoint
     ctx.obj["access_key"] = access_key
     ctx.obj["secret_key"] = secret_key
+
+
+@main.command("init")
+@click.option("--endpoint", prompt="S3/MinIO endpoint", default="http://127.0.0.1:9000")
+@click.option("--bucket", prompt="Bucket name", default="imaging-data")
+@click.option("--access-key", prompt="Access key", default="minioadmin")
+@click.option("--secret-key", prompt="Secret key", hide_input=True, default="minioadmin123")
+@click.option("--region", prompt="Region (empty for MinIO)", default="")
+def init_config(endpoint, bucket, access_key, secret_key, region):
+    """Create ~/.dsimaging.yaml configuration file."""
+    import yaml
+    config = {
+        "default": {
+            "endpoint": endpoint,
+            "bucket": bucket,
+            "access_key": access_key,
+            "secret_key": secret_key,
+            "region": region,
+        }
+    }
+    with open(CONFIG_PATH, "w") as f:
+        yaml.dump(config, f, default_flow_style=False)
+    os.chmod(CONFIG_PATH, 0o600)
+    click.echo(f"Config saved to {CONFIG_PATH}")
 
 
 @main.command()
