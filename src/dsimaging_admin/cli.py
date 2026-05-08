@@ -1,16 +1,19 @@
 """dsimaging-admin CLI."""
 
+import json
 import os
 import sys
 import tempfile
+from urllib.parse import quote
 
 import click
 
 from . import __version__
 from .s3 import create_client, list_datasets, list_objects
 from .manifest import (
-    scan_images, generate_manifest, write_manifest_yaml,
-    build_hash_index, build_sample_manifests, build_samples_metadata,
+    scan_images, scan_s3_images, validate_dataset_id, generate_manifest,
+    write_manifest_yaml, build_hash_index, build_sample_manifests,
+    build_samples_metadata,
 )
 
 
@@ -31,7 +34,7 @@ def _load_config() -> dict:
 
 
 def _default(envvar: str, config_key: str, fallback: str) -> str:
-    """Resolve: env var > config file > hardcoded fallback."""
+    """Resolve CLI defaults as env var > config file > fallback."""
     val = os.environ.get(envvar, "")
     if val:
         return val
@@ -66,6 +69,7 @@ def main(ctx, endpoint, access_key, secret_key, bucket, region):
     ctx.obj["endpoint"] = endpoint
     ctx.obj["access_key"] = access_key
     ctx.obj["secret_key"] = secret_key
+    ctx.obj["region"] = region
 
 
 @main.command("init")
@@ -98,16 +102,26 @@ def init_config(endpoint, bucket, access_key, secret_key, region):
               help="Local directory containing images")
 @click.option("--modality", default="unknown", help="Imaging modality (ct, mri, etc.)")
 @click.option("--opal-url", default=None, help="Opal server URL for resource registration")
-@click.option("--opal-token", default=None, help="Opal auth token")
+@click.option("--opal-token", default=None, envvar="OPAL_TOKEN", help="Opal auth token")
+@click.option("--opal-user", default=None, envvar="OPAL_USER", help="Opal username")
+@click.option("--opal-password", default=None, envvar="OPAL_PASSWORD", help="Opal password")
 @click.option("--opal-project", default="IMAGING", help="Opal project name")
+@click.option("--opal-resource", default=None, help="Opal resource name (defaults to dataset_id)")
+@click.option("--opal-replace", is_flag=True, help="Replace an existing Opal resource")
+@click.option("--opal-insecure", is_flag=True, help="Disable TLS certificate verification for Opal")
 @click.pass_context
-def publish(ctx, dataset_id, source, modality, opal_url, opal_token, opal_project):
+def publish(ctx, dataset_id, source, modality, opal_url, opal_token, opal_user,
+            opal_password, opal_project, opal_resource, opal_replace,
+            opal_insecure):
     """Publish a local dataset to S3/MinIO.
 
     Scans images, computes hashes, generates manifests and indexes,
     uploads everything to S3, and optionally registers as a DataSHIELD resource.
     """
-    import pyarrow.parquet as pq
+    try:
+        validate_dataset_id(dataset_id)
+    except ValueError as e:
+        raise click.ClickException(str(e))
 
     s3 = ctx.obj["s3"]
     bucket = ctx.obj["bucket"]
@@ -139,30 +153,25 @@ def publish(ctx, dataset_id, source, modality, opal_url, opal_token, opal_projec
     click.echo(f"  Uploaded to s3://{bucket}/{prefix}/source/images/")
 
     # 3. Generate and upload indexes
-    with tempfile.TemporaryDirectory() as tmpdir:
-        click.echo("  Building content hash index...")
-        idx = build_hash_index(samples, bucket, prefix)
-        idx_path = os.path.join(tmpdir, "content_hash_index.parquet")
-        pq.write_table(idx, idx_path)
-        s3.upload_file(idx_path, bucket, f"{prefix}/indexes/content_hash_index.parquet")
+    _write_dataset_artifacts(s3, bucket, prefix, dataset_id, modality, samples)
 
-        click.echo("  Building sample manifests...")
-        sm = build_sample_manifests(samples)
-        sm_path = os.path.join(tmpdir, "sample_manifests.parquet")
-        pq.write_table(sm, sm_path)
-        s3.upload_file(sm_path, bucket, f"{prefix}/metadata/sample_manifests.parquet")
-
-        click.echo("  Building samples metadata...")
-        meta = build_samples_metadata(samples)
-        meta_path = os.path.join(tmpdir, "samples.parquet")
-        pq.write_table(meta, meta_path)
-        s3.upload_file(meta_path, bucket, f"{prefix}/metadata/samples.parquet")
-
-        click.echo("  Building manifest...")
-        manifest = generate_manifest(dataset_id, bucket, prefix, modality)
-        manifest_path = os.path.join(tmpdir, "manifest.yaml")
-        write_manifest_yaml(manifest, manifest_path)
-        s3.upload_file(manifest_path, bucket, f"{prefix}/manifest.yaml")
+    resource_url = _resource_url(dataset_id, ctx.obj["endpoint"], bucket,
+                                 prefix, ctx.obj.get("region", ""))
+    if opal_url:
+        click.echo("  Registering Opal resource...")
+        _register_opal_resource(
+            opal_url=opal_url,
+            project=opal_project,
+            name=opal_resource or dataset_id,
+            resource_url=resource_url,
+            access_key=ctx.obj["access_key"],
+            secret_key=ctx.obj["secret_key"],
+            token=opal_token,
+            username=opal_user,
+            password=opal_password,
+            replace=opal_replace,
+            verify=not opal_insecure,
+        )
 
     # 4. Summary
     endpoint = ctx.obj["endpoint"]
@@ -175,7 +184,7 @@ def publish(ctx, dataset_id, source, modality, opal_url, opal_token, opal_projec
     click.echo(f'    ds.radiomics.extract(conns, dataset_id = "{dataset_id}", ...)')
     click.echo("")
     click.echo("  DataSHIELD resource config:")
-    click.echo(f"    URL:      imaging+dataset://{dataset_id}")
+    click.echo(f"    URL:      {resource_url}")
     click.echo(f"    Endpoint: {endpoint}")
     click.echo(f"    Bucket:   {bucket}")
     click.echo(f"    Prefix:   {prefix}")
@@ -257,47 +266,162 @@ def rescan(ctx, dataset_id):
     bucket = ctx.obj["bucket"]
     prefix = f"datasets/{dataset_id}"
 
+    try:
+        validate_dataset_id(dataset_id)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+
     click.echo(f"Rescanning: {dataset_id}")
 
     objects = list_objects(s3, bucket, f"{prefix}/source/images/")
-    from .hashing import is_image_file, sample_id_from_filename
+    click.echo(f"  Found {len(objects)} objects under source/images/")
 
-    images = [o for o in objects if is_image_file(o["key"].split("/")[-1])]
-    click.echo(f"  Found {len(images)} image objects")
+    click.echo("  Computing hashes and rebuilding dataset artifacts...")
+    samples = scan_s3_images(s3, bucket, prefix, objects)
+    if not samples:
+        raise click.ClickException("No supported image objects found.")
 
-    click.echo("  Computing hashes (downloading each file)...")
-    import pyarrow as pa
+    modality = _existing_modality(s3, bucket, prefix, fallback="unknown")
+    _write_dataset_artifacts(s3, bucket, prefix, dataset_id, modality, samples)
+
+    click.echo(f"  Index updated: {len(samples)} samples")
+    click.echo(click.style("Rescan complete.", fg="green"))
+
+
+def _write_dataset_artifacts(s3, bucket: str, prefix: str, dataset_id: str,
+                             modality: str, samples: list[dict]) -> None:
     import pyarrow.parquet as pq
 
-    rows = {k: [] for k in [
-        "sample_id", "uri", "content_hash", "size",
-        "last_modified", "version_id", "etag", "source_kind"
-    ]}
-
     with tempfile.TemporaryDirectory() as tmpdir:
-        for img in images:
-            filename = img["key"].split("/")[-1]
-            local = os.path.join(tmpdir, filename)
-            s3.download_file(bucket, img["key"], local)
-            from .hashing import sha256_file
-            ch = sha256_file(local)
-            os.unlink(local)
-
-            rows["sample_id"].append(sample_id_from_filename(filename))
-            rows["uri"].append(f"s3://{bucket}/{img['key']}")
-            rows["content_hash"].append(ch)
-            rows["size"].append(img["size"])
-            rows["last_modified"].append(img["last_modified"])
-            rows["version_id"].append(None)
-            rows["etag"].append(None)
-            rows["source_kind"].append("single_file")
-
+        click.echo("  Building content hash index...")
+        idx = build_hash_index(samples, bucket, prefix)
         idx_path = os.path.join(tmpdir, "content_hash_index.parquet")
-        pq.write_table(pa.table(rows), idx_path)
+        pq.write_table(idx, idx_path)
         s3.upload_file(idx_path, bucket, f"{prefix}/indexes/content_hash_index.parquet")
 
-    click.echo(f"  Index updated: {len(images)} entries")
-    click.echo(click.style("Rescan complete.", fg="green"))
+        click.echo("  Building sample manifests...")
+        sm = build_sample_manifests(samples)
+        sm_path = os.path.join(tmpdir, "sample_manifests.parquet")
+        pq.write_table(sm, sm_path)
+        s3.upload_file(sm_path, bucket, f"{prefix}/metadata/sample_manifests.parquet")
+
+        click.echo("  Building samples metadata...")
+        meta = build_samples_metadata(samples)
+        meta_path = os.path.join(tmpdir, "samples.parquet")
+        pq.write_table(meta, meta_path)
+        s3.upload_file(meta_path, bucket, f"{prefix}/metadata/samples.parquet")
+
+        click.echo("  Building manifest...")
+        manifest = generate_manifest(dataset_id, bucket, prefix, modality)
+        manifest_path = os.path.join(tmpdir, "manifest.yaml")
+        write_manifest_yaml(manifest, manifest_path)
+        s3.upload_file(manifest_path, bucket, f"{prefix}/manifest.yaml")
+
+
+def _existing_modality(s3, bucket: str, prefix: str, fallback: str) -> str:
+    try:
+        import yaml
+        response = s3.get_object(Bucket=bucket, Key=f"{prefix}/manifest.yaml")
+        body = response["Body"]
+        try:
+            manifest = yaml.safe_load(body.read()) or {}
+        finally:
+            body.close()
+        return manifest.get("modality") or fallback
+    except Exception:
+        return fallback
+
+
+def _resource_url(dataset_id: str, endpoint: str, bucket: str, prefix: str,
+                  region: str = "") -> str:
+    parts = [
+        f"endpoint={quote(endpoint, safe='')}",
+        f"bucket={quote(bucket, safe='')}",
+        f"prefix={quote(prefix, safe='')}",
+    ]
+    if region:
+        parts.append(f"region={quote(region, safe='')}")
+    return f"imaging+dataset://{dataset_id}?" + "&".join(parts)
+
+
+def _register_opal_resource(opal_url: str, project: str, name: str,
+                            resource_url: str, access_key: str,
+                            secret_key: str, token: str | None,
+                            username: str | None, password: str | None,
+                            replace: bool, verify: bool) -> None:
+    try:
+        import requests
+    except ImportError as e:
+        raise click.ClickException("requests is required for Opal registration") from e
+
+    if not verify:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    session = requests.Session()
+    session.verify = verify
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["X-Opal-Auth"] = token
+    elif username and password:
+        session.auth = (username, password)
+    else:
+        raise click.ClickException(
+            "Provide --opal-token or --opal-user/--opal-password for Opal registration."
+        )
+
+    base = opal_url.rstrip("/")
+
+    def request(method: str, path: str, **kwargs):
+        response = session.request(method, f"{base}/ws/{path.lstrip('/')}",
+                                   headers=headers, timeout=30, **kwargs)
+        if response.status_code >= 400:
+            raise click.ClickException(
+                f"Opal {method} {path} failed with {response.status_code}: "
+                f"{response.text[:500]}"
+            )
+        return response
+
+    project_resp = session.get(f"{base}/ws/project/{project}", headers=headers,
+                               timeout=30, verify=verify)
+    if project_resp.status_code == 404:
+        request("POST", "projects", json={"name": project, "title": project})
+    elif project_resp.status_code >= 400:
+        raise click.ClickException(
+            f"Opal project check failed with {project_resp.status_code}: "
+            f"{project_resp.text[:500]}"
+        )
+
+    resource_resp = session.get(f"{base}/ws/project/{project}/resource/{name}",
+                                headers=headers, timeout=30, verify=verify)
+    if resource_resp.status_code == 200:
+        if not replace:
+            click.echo(f"  Opal resource {project}.{name} already exists; keeping it")
+            return
+        request("DELETE", f"project/{project}/resource/{name}")
+    elif resource_resp.status_code != 404:
+        raise click.ClickException(
+            f"Opal resource check failed with {resource_resp.status_code}: "
+            f"{resource_resp.text[:500]}"
+        )
+
+    parameters = {"url": resource_url, "format": None, "_package": None}
+    credentials = {
+        "identity": access_key,
+        "identifier": access_key,
+        "secret": secret_key,
+    }
+    payload = {
+        "provider": "resourcer",
+        "factory": "default",
+        "project": project,
+        "name": name,
+        "description": "dsimaging-store dataset",
+        "parameters": json.dumps(parameters),
+        "credentials": json.dumps(credentials),
+    }
+    request("POST", f"project/{project}/resources", json=payload)
+    click.echo(click.style(f"  Registered Opal resource {project}.{name}", fg="green"))
 
 
 if __name__ == "__main__":

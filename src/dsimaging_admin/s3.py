@@ -50,6 +50,8 @@ def list_objects(s3, bucket: str, prefix: str) -> list[dict]:
                 "key": obj["Key"],
                 "size": obj["Size"],
                 "last_modified": obj["LastModified"].isoformat(),
+                "etag": obj.get("ETag", "").strip('"') or None,
+                "version_id": None,
             })
     return objects
 
