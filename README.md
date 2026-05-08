@@ -27,6 +27,12 @@ dsimaging-admin --endpoint http://minio:9000 doctor
 dsimaging-admin --endpoint http://minio:9000 rescan --dataset-id lung_ct_v1
 ```
 
+For repeated use, create `~/.dsimaging.yaml` once:
+
+```bash
+dsimaging-admin init
+```
+
 ## What `publish` does
 
 1. Scans your local image directory (NIfTI, DICOM, NRRD, etc.)
@@ -37,7 +43,21 @@ dsimaging-admin --endpoint http://minio:9000 rescan --dataset-id lung_ct_v1
    - `content_hash_index.parquet` (dedup index)
    - `sample_manifests.parquet` (multi-file sample support)
    - `samples.parquet` (basic metadata)
-5. Prints the DataSHIELD resource configuration
+5. Optionally registers the dataset as an Opal resource
+6. Prints the DataSHIELD resource configuration
+
+`publish` can register the resource directly in Opal:
+
+```bash
+dsimaging-admin --endpoint http://localhost:9000 publish \
+  --dataset-id lung_ct_v1 \
+  --source /data/lung_ct \
+  --modality ct \
+  --opal-url https://opal.example.org \
+  --opal-user administrator \
+  --opal-password "$OPAL_PASSWORD" \
+  --opal-project IMAGING
+```
 
 ## Environment variables
 
@@ -48,6 +68,16 @@ dsimaging-admin --endpoint http://minio:9000 rescan --dataset-id lung_ct_v1
 | `DSIMAGING_SECRET_KEY` | `minioadmin123` | S3 secret key |
 | `DSIMAGING_BUCKET` | `imaging-data` | Bucket name |
 | `DSIMAGING_REGION` | (empty) | S3 region |
+| `OPAL_TOKEN` | (empty) | Optional Opal token for `publish --opal-url` |
+| `OPAL_USER` | (empty) | Optional Opal username for `publish --opal-url` |
+| `OPAL_PASSWORD` | (empty) | Optional Opal password for `publish --opal-url` |
+
+## Rescan
+
+`rescan --dataset-id <id>` rebuilds `content_hash_index.parquet`,
+`sample_manifests.parquet`, `samples.parquet` and `manifest.yaml` from the
+current contents of `source/images/`. This is the same contract maintained
+automatically by the dsimaging-store controller when MinIO webhooks are enabled.
 
 ## Dataset layout in S3
 
