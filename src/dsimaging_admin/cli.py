@@ -16,7 +16,7 @@ from .manifest import (
     scan_images, scan_masks, scan_s3_images, scan_s3_masks,
     validate_dataset_id, generate_manifest, write_manifest_yaml,
     build_hash_index, build_mask_hash_index, build_sample_manifests,
-    build_samples_metadata,
+    build_samples_metadata, read_metadata_table,
 )
 
 
@@ -103,6 +103,8 @@ def init_config(endpoint, bucket, access_key, secret_key, region):
 @click.option("--dataset-id", required=True, help="Dataset identifier")
 @click.option("--source", required=True, type=click.Path(exists=True),
               help="Local directory containing images")
+@click.option("--metadata", default=None, type=click.Path(exists=True, dir_okay=False),
+              help="Optional CSV/Parquet metadata with a sample_id column")
 @click.option("--modality", default="unknown", help="Imaging modality (ct, mri, etc.)")
 @click.option("--opal-url", default=None, help="Opal server URL for resource registration")
 @click.option("--opal-token", default=None, envvar="OPAL_TOKEN", help="Opal auth token")
@@ -112,10 +114,12 @@ def init_config(endpoint, bucket, access_key, secret_key, region):
 @click.option("--opal-resource", default=None, help="Opal resource name (defaults to dataset_id)")
 @click.option("--opal-replace", is_flag=True, help="Replace an existing Opal resource")
 @click.option("--opal-insecure", is_flag=True, help="Disable TLS certificate verification for Opal")
+@click.option("--resource-endpoint", default=None,
+              help="Endpoint stored in the Opal resource URL (for container-internal S3 DNS)")
 @click.pass_context
-def publish(ctx, dataset_id, source, modality, opal_url, opal_token, opal_user,
-            opal_password, opal_project, opal_resource, opal_replace,
-            opal_insecure):
+def publish(ctx, dataset_id, source, metadata, modality, opal_url, opal_token,
+            opal_user, opal_password, opal_project, opal_resource,
+            opal_replace, opal_insecure, resource_endpoint):
     """Publish a local dataset to S3/MinIO.
 
     Scans images, computes hashes, generates manifests and indexes,
@@ -148,6 +152,17 @@ def publish(ctx, dataset_id, source, modality, opal_url, opal_token, opal_user,
     else:
         click.echo("  No masks found")
 
+    extra_metadata = None
+    if metadata:
+        click.echo("  Reading metadata...")
+        try:
+            extra_metadata = read_metadata_table(metadata)
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
+        click.echo(
+            f"  Metadata columns: {', '.join(extra_metadata.column_names)}"
+        )
+
     # 2. Upload images
     click.echo("  Uploading images to S3...")
     for sample in samples:
@@ -171,9 +186,9 @@ def publish(ctx, dataset_id, source, modality, opal_url, opal_token, opal_user,
 
     # 3. Generate and upload indexes
     _write_dataset_artifacts(s3, bucket, prefix, dataset_id, modality, samples,
-                             masks=masks)
+                             masks=masks, extra_metadata=extra_metadata)
 
-    resource_url = _resource_url(dataset_id, ctx.obj["endpoint"], bucket,
+    resource_url = _resource_url(dataset_id, resource_endpoint or ctx.obj["endpoint"], bucket,
                                  prefix, ctx.obj.get("region", ""))
     if opal_url:
         click.echo("  Registering Opal resource...")
@@ -305,8 +320,9 @@ def rescan(ctx, dataset_id):
                           sample_ids=[sample["sample_id"] for sample in samples])
 
     modality = _existing_modality(s3, bucket, prefix, fallback="unknown")
+    extra_metadata = _read_existing_samples_metadata(s3, bucket, prefix)
     _write_dataset_artifacts(s3, bucket, prefix, dataset_id, modality, samples,
-                             masks=masks)
+                             masks=masks, extra_metadata=extra_metadata)
 
     click.echo(f"  Index updated: {len(samples)} samples, {len(masks)} masks")
     click.echo(click.style("Rescan complete.", fg="green"))
@@ -314,7 +330,8 @@ def rescan(ctx, dataset_id):
 
 def _write_dataset_artifacts(s3, bucket: str, prefix: str, dataset_id: str,
                              modality: str, samples: list[dict],
-                             masks: list[dict] | None = None) -> None:
+                             masks: list[dict] | None = None,
+                             extra_metadata=None) -> None:
     import pyarrow.parquet as pq
 
     masks = masks or []
@@ -340,7 +357,7 @@ def _write_dataset_artifacts(s3, bucket: str, prefix: str, dataset_id: str,
         s3.upload_file(sm_path, bucket, f"{prefix}/metadata/sample_manifests.parquet")
 
         click.echo("  Building samples metadata...")
-        meta = build_samples_metadata(samples)
+        meta = build_samples_metadata(samples, extra_metadata=extra_metadata)
         meta_path = os.path.join(tmpdir, "samples.parquet")
         pq.write_table(meta, meta_path)
         s3.upload_file(meta_path, bucket, f"{prefix}/metadata/samples.parquet")
@@ -351,6 +368,24 @@ def _write_dataset_artifacts(s3, bucket: str, prefix: str, dataset_id: str,
         manifest_path = os.path.join(tmpdir, "manifest.yaml")
         write_manifest_yaml(manifest, manifest_path)
         s3.upload_file(manifest_path, bucket, f"{prefix}/manifest.yaml")
+
+
+def _read_existing_samples_metadata(s3, bucket: str, prefix: str):
+    import pyarrow.parquet as pq
+
+    try:
+        response = s3.get_object(Bucket=bucket, Key=f"{prefix}/metadata/samples.parquet")
+        body = response["Body"]
+        try:
+            data = body.read()
+        finally:
+            body.close()
+        if not data:
+            return None
+        import pyarrow as pa
+        return pq.read_table(pa.BufferReader(data))
+    except Exception:
+        return None
 
 
 def _existing_modality(s3, bucket: str, prefix: str, fallback: str) -> str:

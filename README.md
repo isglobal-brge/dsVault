@@ -15,6 +15,7 @@ pip install dsimaging-admin
 dsimaging-admin --endpoint http://minio:9000 publish \
   --dataset-id lung_ct_v1 \
   --source /data/lung_ct \
+  --metadata /data/lung_ct/clinical.csv \
   --modality ct
 
 # 2. List published datasets
@@ -45,7 +46,7 @@ dsimaging-admin init
    - `content_hash_index.parquet` (dedup index)
    - `masks_content_hash_index.parquet` (mask dedup index, when masks exist)
    - `sample_manifests.parquet` (multi-file sample support)
-   - `samples.parquet` (basic metadata)
+   - `samples.parquet` (basic metadata plus optional `--metadata` columns)
 6. Optionally registers the dataset as an Opal resource
 7. Prints the DataSHIELD resource configuration
 
@@ -55,12 +56,24 @@ dsimaging-admin init
 dsimaging-admin --endpoint http://localhost:9000 publish \
   --dataset-id lung_ct_v1 \
   --source /data/lung_ct \
+  --metadata /data/lung_ct/clinical.csv \
   --modality ct \
+  --resource-endpoint http://minio.local:9000 \
   --opal-url https://opal.example.org \
   --opal-user administrator \
   --opal-password "$OPAL_PASSWORD" \
   --opal-project IMAGING
 ```
+
+`--metadata` accepts CSV or Parquet files with a unique `sample_id` column. The
+extra columns are left-joined to discovered imaging samples and stored in
+`metadata/samples.parquet`, so clinical/outcome variables can be loaded later
+with derived radiomics features inside DataSHIELD. `rescan` and the store
+controller preserve these extra metadata columns when rebuilding indexes.
+
+Use `--resource-endpoint` when the upload endpoint and the Rock-visible endpoint
+are different, for example uploading from the Docker host through
+`http://127.0.0.1:9000` while Rocks reach MinIO as `http://minio.local:9000`.
 
 ## Environment variables
 
