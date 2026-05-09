@@ -7,7 +7,9 @@ from dsimaging_admin.manifest import (
     build_hash_index,
     build_mask_hash_index,
     build_sample_manifests,
+    build_samples_metadata,
     generate_manifest,
+    read_metadata_table,
     scan_images,
     scan_masks,
     scan_s3_images,
@@ -146,6 +148,54 @@ class ManifestTests(unittest.TestCase):
             "s3://imaging-data/datasets/lung/source/images/a.nii.gz",
         )
         self.assertEqual(manifests.to_pydict()["n_files"][0], 1)
+
+    def test_samples_metadata_can_include_clinical_columns(self):
+        samples = [{
+            "sample_id": "case001",
+            "source_kind": "single_file",
+            "primary_filename": "case001.nii.gz",
+            "uri_path": "case001.nii.gz",
+            "files": [{"path": "case001.nii.gz", "role": "primary"}],
+            "content_hash": "abc",
+            "size": 5,
+        }]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metadata_path = os.path.join(tmpdir, "clinical.csv")
+            with open(metadata_path, "w", encoding="utf-8") as f:
+                f.write("sample_id,age,deadstatus_event\n")
+                f.write("case001,68,1\n")
+                f.write("case999,71,0\n")
+
+            metadata = read_metadata_table(metadata_path)
+            table = build_samples_metadata(samples, extra_metadata=metadata)
+
+        values = table.to_pydict()
+        self.assertEqual(values["sample_id"], ["case001"])
+        self.assertEqual(values["age"], [68])
+        self.assertEqual(values["deadstatus_event"], [1])
+
+    def test_samples_metadata_rejects_duplicate_clinical_rows(self):
+        samples = [
+            {
+                "sample_id": "case001",
+                "source_kind": "single_file",
+                "primary_filename": "case001.nii.gz",
+                "uri_path": "case001.nii.gz",
+                "files": [{"path": "case001.nii.gz", "role": "primary"}],
+                "content_hash": "abc",
+                "size": 5,
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metadata_path = os.path.join(tmpdir, "clinical.csv")
+            with open(metadata_path, "w", encoding="utf-8") as f:
+                f.write("sample_id,age\ncase001,68\ncase001,70\n")
+
+            metadata = read_metadata_table(metadata_path)
+            with self.assertRaises(ValueError):
+                build_samples_metadata(samples, extra_metadata=metadata)
 
 
 if __name__ == "__main__":

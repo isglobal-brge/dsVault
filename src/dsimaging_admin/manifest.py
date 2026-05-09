@@ -9,6 +9,8 @@ import re
 import time
 
 import pyarrow as pa
+import pyarrow.csv as pacsv
+import pyarrow.parquet as pq
 import yaml
 
 from .hashing import sha256_file, is_image_file, sample_id_from_filename
@@ -293,12 +295,69 @@ def build_sample_manifests(samples: list[dict]) -> pa.Table:
     })
 
 
-def build_samples_metadata(samples: list[dict]) -> pa.Table:
-    return pa.table({
+def build_samples_metadata(samples: list[dict],
+                           extra_metadata: pa.Table | None = None) -> pa.Table:
+    """Build sample metadata, optionally left-joining user metadata.
+
+    ``extra_metadata`` must contain a unique ``sample_id`` column. Extra rows
+    that do not correspond to discovered images are ignored; missing rows for
+    image samples become nulls. This keeps the manifest image-led while allowing
+    clinical/outcome variables to travel with the dataset.
+    """
+    base = pa.table({
         "sample_id": [s["sample_id"] for s in samples],
         "source_kind": [s["source_kind"] for s in samples],
         "n_files": pa.array([len(s["files"]) for s in samples], type=pa.int32()),
     })
+    if extra_metadata is None:
+        return base
+    return _left_join_metadata(base, extra_metadata)
+
+
+def read_metadata_table(path: str) -> pa.Table:
+    """Read a CSV or Parquet metadata table with a string ``sample_id``."""
+    lower = path.lower()
+    if lower.endswith(".parquet"):
+        table = pq.read_table(path)
+    elif lower.endswith(".csv"):
+        table = pacsv.read_csv(path)
+    else:
+        raise ValueError("metadata must be a .csv or .parquet file")
+    return _normalise_metadata_table(table)
+
+
+def _normalise_metadata_table(table: pa.Table) -> pa.Table:
+    if "sample_id" not in table.column_names:
+        raise ValueError("metadata must contain a sample_id column")
+    idx = table.column_names.index("sample_id")
+    return table.set_column(idx, "sample_id", table["sample_id"].cast(pa.string()))
+
+
+def _left_join_metadata(base: pa.Table, extra_metadata: pa.Table) -> pa.Table:
+    extra_metadata = _normalise_metadata_table(extra_metadata)
+    base_ids = base["sample_id"].to_pylist()
+    rows_by_id: dict[str, dict] = {}
+    for row in extra_metadata.to_pylist():
+        sample_id = row.get("sample_id")
+        if sample_id in rows_by_id:
+            raise ValueError(f"metadata has duplicate sample_id: {sample_id}")
+        rows_by_id[sample_id] = row
+
+    extra_columns = [
+        name for name in extra_metadata.column_names
+        if name != "sample_id" and name not in base.column_names
+    ]
+    arrays = {name: base[name] for name in base.column_names}
+    schema = extra_metadata.schema
+    for name in extra_columns:
+        field = schema.field(name)
+        values = [
+            rows_by_id.get(sample_id, {}).get(name)
+            for sample_id in base_ids
+        ]
+        arrays[name] = pa.array(values, type=field.type)
+
+    return pa.table(arrays)
 
 
 def _find_images_dir(source_dir: str) -> str | None:
