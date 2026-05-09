@@ -34,5 +34,5 @@ dependencies = [
 dsimaging-admin = "dsimaging_admin.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/dsFlower/dsimaging-admin"
-Repository = "https://github.com/dsFlower/dsimaging-admin"
+Homepage = "https://github.com/isglobal-brge/dsimaging-admin"
+Repository = "https://github.com/isglobal-brge/dsimaging-admin"
