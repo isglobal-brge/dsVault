@@ -1,5 +1,7 @@
 """dsimaging-admin CLI."""
 
+from __future__ import annotations
+
 import json
 import os
 import sys
@@ -11,8 +13,9 @@ import click
 from . import __version__
 from .s3 import create_client, list_datasets, list_objects
 from .manifest import (
-    scan_images, scan_s3_images, validate_dataset_id, generate_manifest,
-    write_manifest_yaml, build_hash_index, build_sample_manifests,
+    scan_images, scan_masks, scan_s3_images, scan_s3_masks,
+    validate_dataset_id, generate_manifest, write_manifest_yaml,
+    build_hash_index, build_mask_hash_index, build_sample_manifests,
     build_samples_metadata,
 )
 
@@ -138,6 +141,13 @@ def publish(ctx, dataset_id, source, modality, opal_url, opal_token, opal_user,
         sys.exit(1)
     click.echo(f"  Found {len(samples)} samples")
 
+    click.echo("  Scanning masks...")
+    masks = scan_masks(source, sample_ids=[sample["sample_id"] for sample in samples])
+    if masks:
+        click.echo(f"  Found {len(masks)} masks")
+    else:
+        click.echo("  No masks found")
+
     # 2. Upload images
     click.echo("  Uploading images to S3...")
     for sample in samples:
@@ -152,8 +162,16 @@ def publish(ctx, dataset_id, source, modality, opal_url, opal_token, opal_user,
                 s3.upload_file(local, bucket, key)
     click.echo(f"  Uploaded to s3://{bucket}/{prefix}/source/images/")
 
+    if masks:
+        click.echo("  Uploading masks to S3...")
+        for mask in masks:
+            key = f"{prefix}/source/masks/{mask['uri_path']}"
+            s3.upload_file(mask["local_path"], bucket, key)
+        click.echo(f"  Uploaded to s3://{bucket}/{prefix}/source/masks/")
+
     # 3. Generate and upload indexes
-    _write_dataset_artifacts(s3, bucket, prefix, dataset_id, modality, samples)
+    _write_dataset_artifacts(s3, bucket, prefix, dataset_id, modality, samples,
+                             masks=masks)
 
     resource_url = _resource_url(dataset_id, ctx.obj["endpoint"], bucket,
                                  prefix, ctx.obj.get("region", ""))
@@ -179,6 +197,7 @@ def publish(ctx, dataset_id, source, modality, opal_url, opal_token, opal_user,
     click.echo(click.style(f"Dataset '{dataset_id}' published!", fg="green", bold=True))
     click.echo(f"  Location: s3://{bucket}/{prefix}/")
     click.echo(f"  Samples:  {len(samples)}")
+    click.echo(f"  Masks:    {len(masks)}")
     click.echo("")
     click.echo("  To use in R:")
     click.echo(f'    ds.radiomics.extract(conns, dataset_id = "{dataset_id}", ...)')
@@ -275,29 +294,44 @@ def rescan(ctx, dataset_id):
 
     objects = list_objects(s3, bucket, f"{prefix}/source/images/")
     click.echo(f"  Found {len(objects)} objects under source/images/")
+    mask_objects = list_objects(s3, bucket, f"{prefix}/source/masks/")
+    click.echo(f"  Found {len(mask_objects)} objects under source/masks/")
 
     click.echo("  Computing hashes and rebuilding dataset artifacts...")
     samples = scan_s3_images(s3, bucket, prefix, objects)
     if not samples:
         raise click.ClickException("No supported image objects found.")
+    masks = scan_s3_masks(s3, bucket, prefix, mask_objects,
+                          sample_ids=[sample["sample_id"] for sample in samples])
 
     modality = _existing_modality(s3, bucket, prefix, fallback="unknown")
-    _write_dataset_artifacts(s3, bucket, prefix, dataset_id, modality, samples)
+    _write_dataset_artifacts(s3, bucket, prefix, dataset_id, modality, samples,
+                             masks=masks)
 
-    click.echo(f"  Index updated: {len(samples)} samples")
+    click.echo(f"  Index updated: {len(samples)} samples, {len(masks)} masks")
     click.echo(click.style("Rescan complete.", fg="green"))
 
 
 def _write_dataset_artifacts(s3, bucket: str, prefix: str, dataset_id: str,
-                             modality: str, samples: list[dict]) -> None:
+                             modality: str, samples: list[dict],
+                             masks: list[dict] | None = None) -> None:
     import pyarrow.parquet as pq
 
+    masks = masks or []
     with tempfile.TemporaryDirectory() as tmpdir:
         click.echo("  Building content hash index...")
         idx = build_hash_index(samples, bucket, prefix)
         idx_path = os.path.join(tmpdir, "content_hash_index.parquet")
         pq.write_table(idx, idx_path)
         s3.upload_file(idx_path, bucket, f"{prefix}/indexes/content_hash_index.parquet")
+
+        if masks:
+            click.echo("  Building mask content hash index...")
+            mask_idx = build_mask_hash_index(masks, bucket, prefix)
+            mask_idx_path = os.path.join(tmpdir, "masks_content_hash_index.parquet")
+            pq.write_table(mask_idx, mask_idx_path)
+            s3.upload_file(mask_idx_path, bucket,
+                           f"{prefix}/indexes/masks_content_hash_index.parquet")
 
         click.echo("  Building sample manifests...")
         sm = build_sample_manifests(samples)
@@ -312,7 +346,8 @@ def _write_dataset_artifacts(s3, bucket: str, prefix: str, dataset_id: str,
         s3.upload_file(meta_path, bucket, f"{prefix}/metadata/samples.parquet")
 
         click.echo("  Building manifest...")
-        manifest = generate_manifest(dataset_id, bucket, prefix, modality)
+        manifest = generate_manifest(dataset_id, bucket, prefix, modality,
+                                     has_masks=bool(masks))
         manifest_path = os.path.join(tmpdir, "manifest.yaml")
         write_manifest_yaml(manifest, manifest_path)
         s3.upload_file(manifest_path, bucket, f"{prefix}/manifest.yaml")

@@ -5,9 +5,13 @@ import unittest
 
 from dsimaging_admin.manifest import (
     build_hash_index,
+    build_mask_hash_index,
     build_sample_manifests,
+    generate_manifest,
     scan_images,
+    scan_masks,
     scan_s3_images,
+    scan_s3_masks,
     validate_dataset_id,
 )
 
@@ -69,6 +73,59 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(samples[0]["uri_path"], "a.nii.gz")
         self.assertEqual(samples[1]["source_kind"], "dicom_series")
         self.assertEqual(len(samples[1]["files"]), 2)
+
+    def test_scan_masks_maps_common_suffixes_to_image_samples(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            masks_dir = os.path.join(tmpdir, "source", "masks")
+            os.makedirs(masks_dir)
+            with open(os.path.join(masks_dir, "case001_GTV-1.nii.gz"), "wb") as f:
+                f.write(b"mask-1")
+            with open(os.path.join(masks_dir, "case002_mask.nii.gz"), "wb") as f:
+                f.write(b"mask-2")
+
+            masks = scan_masks(tmpdir, sample_ids=["case001", "case002"])
+
+        self.assertEqual([mask["sample_id"] for mask in masks], ["case001", "case002"])
+        self.assertEqual(masks[0]["source_kind"], "mask_file")
+        self.assertEqual(masks[0]["uri_path"], "case001_GTV-1.nii.gz")
+
+    def test_scan_s3_masks_and_hash_index_use_mask_uris(self):
+        bucket = "imaging-data"
+        prefix = "datasets/lung"
+        payloads = {
+            f"{prefix}/source/masks/case001_GTV-1.nii.gz": b"mask",
+        }
+        objects = [
+            {"key": key, "size": len(value), "last_modified": "2026-05-08T00:00:00Z"}
+            for key, value in payloads.items()
+        ]
+
+        masks = scan_s3_masks(
+            FakeS3(payloads), bucket, prefix, objects,
+            sample_ids=["case001"],
+        )
+        mask_index = build_mask_hash_index(masks, bucket, prefix)
+
+        self.assertEqual(masks[0]["sample_id"], "case001")
+        self.assertEqual(
+            mask_index.to_pydict()["uri"][0],
+            "s3://imaging-data/datasets/lung/source/masks/case001_GTV-1.nii.gz",
+        )
+
+    def test_generate_manifest_can_declare_mask_asset(self):
+        manifest = generate_manifest(
+            "lung",
+            "imaging-data",
+            "datasets/lung",
+            modality="ct",
+            has_masks=True,
+        )
+
+        self.assertEqual(manifest["assets"]["masks"]["kind"], "mask_root")
+        self.assertEqual(
+            manifest["assets"]["masks"]["content_hash_index"],
+            "s3://imaging-data/datasets/lung/indexes/masks_content_hash_index.parquet",
+        )
 
     def test_build_tables_use_canonical_uris(self):
         samples = [{

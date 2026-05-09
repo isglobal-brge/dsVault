@@ -1,5 +1,7 @@
 """Manifest and index generation."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
@@ -72,6 +74,33 @@ def scan_images(source_dir: str) -> list[dict]:
                 })
 
     return samples
+
+
+def scan_masks(source_dir: str, sample_ids: list[str] | None = None) -> list[dict]:
+    """Scan a local directory for mask files and compute hashes."""
+    masks = []
+    masks_dir = _find_masks_dir(source_dir)
+    if not masks_dir:
+        return masks
+
+    for root, _, files in os.walk(masks_dir):
+        for entry in sorted(files):
+            filepath = os.path.join(root, entry)
+            if not os.path.isfile(filepath) or not is_image_file(entry):
+                continue
+            rel = os.path.relpath(filepath, masks_dir).replace(os.sep, "/")
+            masks.append({
+                "sample_id": _sample_id_from_mask_filename(entry, sample_ids),
+                "source_kind": "mask_file",
+                "primary_filename": entry,
+                "uri_path": rel,
+                "files": [{"path": rel, "role": "mask"}],
+                "content_hash": sha256_file(filepath),
+                "size": os.path.getsize(filepath),
+                "local_path": filepath,
+            })
+
+    return sorted(masks, key=lambda sample: sample["sample_id"])
 
 
 def scan_s3_images(s3, bucket: str, prefix: str, objects: list[dict]) -> list[dict]:
@@ -149,11 +178,45 @@ def scan_s3_images(s3, bucket: str, prefix: str, objects: list[dict]) -> list[di
     return sorted(samples, key=lambda sample: sample["sample_id"])
 
 
+def scan_s3_masks(s3, bucket: str, prefix: str, objects: list[dict],
+                  sample_ids: list[str] | None = None) -> list[dict]:
+    """Build mask records from S3 objects under ``<prefix>/source/masks``."""
+    root = f"{prefix.rstrip('/')}/source/masks/"
+    masks = []
+
+    for obj in objects:
+        key = obj["key"]
+        if not key.startswith(root):
+            continue
+        rel = key[len(root):]
+        if not rel or rel.endswith("/"):
+            continue
+        filename = rel.rsplit("/", 1)[-1]
+        if not is_image_file(filename):
+            continue
+        content_hash = _sha256_s3_object(s3, bucket, key)
+        masks.append({
+            "sample_id": _sample_id_from_mask_filename(filename, sample_ids),
+            "source_kind": "mask_file",
+            "primary_filename": filename,
+            "uri_path": rel,
+            "files": [{"path": rel, "role": "mask"}],
+            "content_hash": content_hash,
+            "size": int(obj.get("size", 0)),
+            "last_modified": obj.get("last_modified"),
+            "version_id": obj.get("version_id"),
+            "etag": obj.get("etag"),
+        })
+
+    return sorted(masks, key=lambda sample: sample["sample_id"])
+
+
 def generate_manifest(dataset_id: str, bucket: str, prefix: str,
-                      modality: str = "unknown") -> dict:
+                      modality: str = "unknown", has_masks: bool = False,
+                      mask_asset: str = "masks") -> dict:
     """Generate a manifest dict for a dataset."""
     validate_dataset_id(dataset_id)
-    return {
+    manifest = {
         "schema_version": 1,
         "dataset_id": dataset_id,
         "modality": modality,
@@ -176,6 +239,16 @@ def generate_manifest(dataset_id: str, bucket: str, prefix: str,
             "format": "parquet",
         },
     }
+    if has_masks:
+        manifest["assets"][mask_asset] = {
+            "uri": f"s3://{bucket}/{prefix}/source/masks/",
+            "kind": "mask_root",
+            "content_hash_index": (
+                f"s3://{bucket}/{prefix}/indexes/"
+                f"{mask_asset}_content_hash_index.parquet"
+            ),
+        }
+    return manifest
 
 
 def write_manifest_yaml(manifest: dict, path: str):
@@ -183,14 +256,15 @@ def write_manifest_yaml(manifest: dict, path: str):
         yaml.dump(manifest, f, default_flow_style=False, sort_keys=False)
 
 
-def build_hash_index(samples: list[dict], bucket: str, prefix: str) -> pa.Table:
+def build_hash_index(samples: list[dict], bucket: str, prefix: str,
+                     source_path: str = "images") -> pa.Table:
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ")
     return pa.table({
         "sample_id": [s["sample_id"] for s in samples],
         "uri": [
-            f"s3://{bucket}/{prefix}/source/images/{s.get('uri_path') or s['primary_filename']}"
+            f"s3://{bucket}/{prefix}/source/{source_path}/{s.get('uri_path') or s['primary_filename']}"
             if s.get("uri_path") or s["primary_filename"]
-            else f"s3://{bucket}/{prefix}/source/images/{s['sample_id']}/"
+            else f"s3://{bucket}/{prefix}/source/{source_path}/{s['sample_id']}/"
             for s in samples
         ],
         "content_hash": [s["content_hash"] for s in samples],
@@ -200,6 +274,10 @@ def build_hash_index(samples: list[dict], bucket: str, prefix: str) -> pa.Table:
         "etag": pa.array([s.get("etag") for s in samples], type=pa.string()),
         "source_kind": [s["source_kind"] for s in samples],
     })
+
+
+def build_mask_hash_index(masks: list[dict], bucket: str, prefix: str) -> pa.Table:
+    return build_hash_index(masks, bucket, prefix, source_path="masks")
 
 
 def build_sample_manifests(samples: list[dict]) -> pa.Table:
@@ -232,6 +310,15 @@ def _find_images_dir(source_dir: str) -> str | None:
     return None
 
 
+def _find_masks_dir(source_dir: str) -> str | None:
+    """Find the directory containing mask files."""
+    for candidate in ["masks", "source/masks", "labels", "source/labels"]:
+        d = os.path.join(source_dir, candidate)
+        if os.path.isdir(d) and _contains_supported_masks(d):
+            return d
+    return None
+
+
 def _contains_supported_images(directory: str) -> bool:
     for entry in os.listdir(directory):
         path = os.path.join(directory, entry)
@@ -241,6 +328,28 @@ def _contains_supported_images(directory: str) -> bool:
             if any(f.lower().endswith(".dcm") for f in os.listdir(path)):
                 return True
     return False
+
+
+def _contains_supported_masks(directory: str) -> bool:
+    for _, _, files in os.walk(directory):
+        if any(is_image_file(f) for f in files):
+            return True
+    return False
+
+
+def _sample_id_from_mask_filename(filename: str,
+                                  sample_ids: list[str] | None = None) -> str:
+    stem = sample_id_from_filename(filename)
+    if sample_ids:
+        for sample_id in sorted(sample_ids, key=len, reverse=True):
+            if stem == sample_id or stem.startswith(f"{sample_id}_") or stem.startswith(f"{sample_id}-"):
+                return sample_id
+    suffix_pattern = (
+        r"(?i)(?:[_-](?:mask|seg|label|labels|roi|gtv[-_]?\d*|"
+        r"lesion[-_]?\d*|tumou?r[-_]?\d*))$"
+    )
+    stripped = re.sub(suffix_pattern, "", stem)
+    return stripped or stem
 
 
 def _sha256_s3_object(s3, bucket: str, key: str) -> str:
