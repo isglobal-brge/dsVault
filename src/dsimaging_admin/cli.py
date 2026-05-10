@@ -215,7 +215,7 @@ def publish(ctx, dataset_id, source, metadata, modality, opal_url, opal_token,
     click.echo(f"  Masks:    {len(masks)}")
     click.echo("")
     click.echo("  To use in R:")
-    click.echo(f'    ds.radiomics.extract(conns, dataset_id = "{dataset_id}", ...)')
+    click.echo(f'    ds.imaging.radiomics.extract(conns, dataset_id = "{dataset_id}", ...)')
     click.echo("")
     click.echo("  DataSHIELD resource config:")
     click.echo(f"    URL:      {resource_url}")
