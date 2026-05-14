@@ -32,7 +32,7 @@ class FakeS3:
 
 class ManifestTests(unittest.TestCase):
     def test_validate_dataset_id_rejects_unsafe_values(self):
-        validate_dataset_id("lung1_site-a.v1")
+        validate_dataset_id("study_ct_v1_site-a.v1")
         with self.assertRaises(ValueError):
             validate_dataset_id("../bad")
         with self.assertRaises(ValueError):
@@ -56,7 +56,7 @@ class ManifestTests(unittest.TestCase):
 
     def test_scan_s3_images_groups_single_files_and_dicom(self):
         bucket = "imaging-data"
-        prefix = "datasets/lung"
+        prefix = "datasets/study_ct_v1"
         payloads = {
             f"{prefix}/source/images/a.nii.gz": b"nifti",
             f"{prefix}/source/images/series1/001.dcm": b"one",
@@ -93,7 +93,7 @@ class ManifestTests(unittest.TestCase):
 
     def test_scan_s3_masks_and_hash_index_use_mask_uris(self):
         bucket = "imaging-data"
-        prefix = "datasets/lung"
+        prefix = "datasets/study_ct_v1"
         payloads = {
             f"{prefix}/source/masks/case001_GTV-1.nii.gz": b"mask",
         }
@@ -111,14 +111,14 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(masks[0]["sample_id"], "case001")
         self.assertEqual(
             mask_index.to_pydict()["uri"][0],
-            "s3://imaging-data/datasets/lung/source/masks/case001_GTV-1.nii.gz",
+            "s3://imaging-data/datasets/study_ct_v1/source/masks/case001_GTV-1.nii.gz",
         )
 
     def test_generate_manifest_can_declare_mask_asset(self):
         manifest = generate_manifest(
-            "lung",
+            "study_ct_v1",
             "imaging-data",
-            "datasets/lung",
+            "datasets/study_ct_v1",
             modality="ct",
             has_masks=True,
         )
@@ -126,7 +126,7 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(manifest["assets"]["masks"]["kind"], "mask_root")
         self.assertEqual(
             manifest["assets"]["masks"]["content_hash_index"],
-            "s3://imaging-data/datasets/lung/indexes/masks_content_hash_index.parquet",
+            "s3://imaging-data/datasets/study_ct_v1/indexes/masks_content_hash_index.parquet",
         )
 
     def test_build_tables_use_canonical_uris(self):
@@ -140,12 +140,12 @@ class ManifestTests(unittest.TestCase):
             "size": 5,
         }]
 
-        hash_index = build_hash_index(samples, "imaging-data", "datasets/lung")
+        hash_index = build_hash_index(samples, "imaging-data", "datasets/study_ct_v1")
         manifests = build_sample_manifests(samples)
 
         self.assertEqual(
             hash_index.to_pydict()["uri"][0],
-            "s3://imaging-data/datasets/lung/source/images/a.nii.gz",
+            "s3://imaging-data/datasets/study_ct_v1/source/images/a.nii.gz",
         )
         self.assertEqual(manifests.to_pydict()["n_files"][0], 1)
 

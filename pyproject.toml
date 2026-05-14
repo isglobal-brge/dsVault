@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dsimaging-admin"
-version = "0.2.0"
+version = "0.3.5"
 description = "Admin CLI for managing medical imaging datasets in S3/MinIO for DataSHIELD"
 readme = "README.md"
 license = "MIT"
@@ -28,6 +28,7 @@ dependencies = [
     "pyyaml>=6.0",
     "click>=8.0.0",
     "requests>=2.31.0",
+    "pydicom>=3.0.0",
 ]
 
 [project.scripts]

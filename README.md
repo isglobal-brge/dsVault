@@ -1,6 +1,7 @@
 # dsimaging-admin
 
-Admin CLI for managing medical imaging datasets in S3/MinIO for DataSHIELD.
+Admin CLI for creating and operating `dsimaging-store` deployments and the
+medical imaging datasets stored in them.
 
 ## Install
 
@@ -8,97 +9,118 @@ Admin CLI for managing medical imaging datasets in S3/MinIO for DataSHIELD.
 pip install dsimaging-admin
 ```
 
-## Quick start
+## Create a store
+
+`dsimaging-admin store init` writes a Docker Compose project for MinIO plus the
+`dsimaging-store` controller.
 
 ```bash
-# 1. Publish a local dataset to MinIO
-dsimaging-admin --endpoint http://minio:9000 publish \
-  --dataset-id lung_ct_v1 \
-  --source /data/lung_ct \
-  --metadata /data/lung_ct/clinical.csv \
-  --modality ct
-
-# 2. List published datasets
-dsimaging-admin --endpoint http://minio:9000 list
-
-# 3. Check health
-dsimaging-admin --endpoint http://minio:9000 doctor
-
-# 4. Re-scan after adding images
-dsimaging-admin --endpoint http://minio:9000 rescan --dataset-id lung_ct_v1
+dsimaging-admin store init ./study-store \
+  --controller-image davidsarratgonzalez/dsimaging-store:latest
+dsimaging-admin store up ./study-store
+dsimaging-admin store doctor ./study-store
 ```
 
-For repeated use, create `~/.dsimaging.yaml` once:
+For local controller development, build from a checked-out `dsimaging-store`
+repo instead of using an image:
 
 ```bash
-dsimaging-admin init
+dsimaging-admin store init ./study-store \
+  --store-source /path/to/dsimaging-store
+dsimaging-admin store up ./study-store
+```
+
+Use the generated connection details as a reusable CLI profile:
+
+```bash
+dsimaging-admin init \
+  --endpoint http://127.0.0.1:9000 \
+  --controller-url http://127.0.0.1:8080 \
+  --bucket imaging-data
+```
+
+## Dataset operations
+
+```bash
+# Publish with staging, publish lock, skip-if-hash-matches and DICOM checks.
+dsimaging-admin publish \
+  --dataset-id study_ct_v1 \
+  --source /data/study_ct \
+  --metadata /data/study_ct/clinical.csv \
+  --modality ct
+
+# Inspect and verify.
+dsimaging-admin list
+dsimaging-admin status study_ct_v1
+dsimaging-admin verify study_ct_v1
+dsimaging-admin doctor
+
+# Rebuild artifacts from S3, copy, download or delete.
+dsimaging-admin rescan study_ct_v1
+dsimaging-admin copy study_ct_v1 study_ct_v2 --yes
+dsimaging-admin download study_ct_v1 ./debug/study_ct_v1
+dsimaging-admin delete study_ct_v1 --yes --purge-versions
+```
+
+All reporting commands that are useful for automation support JSON output:
+
+```bash
+dsimaging-admin list --output json
+dsimaging-admin status study_ct_v1 --output json
+dsimaging-admin verify study_ct_v1 --output json
+dsimaging-admin doctor --output json
 ```
 
 ## What `publish` does
 
-1. Scans your local image directory (NIfTI, DICOM, NRRD, etc.) and optional
-   masks under `source/masks/`, `masks/`, `source/labels/`, or `labels/`
-2. Computes SHA-256 content hash for every file
-3. Uploads images to `s3://<bucket>/datasets/<dataset_id>/source/images/`
-4. Uploads masks, when present, to `s3://<bucket>/datasets/<dataset_id>/source/masks/`
-5. Generates and uploads:
-   - `manifest.yaml` (dataset descriptor)
-   - `content_hash_index.parquet` (dedup index)
-   - `masks_content_hash_index.parquet` (mask dedup index, when masks exist)
-   - `sample_manifests.parquet` (multi-file sample support)
-   - `samples.parquet` (basic metadata plus optional `--metadata` columns)
-6. Optionally registers the dataset as an Opal resource
-7. Prints the DataSHIELD resource configuration
+1. Scans your local image directory and optional masks under `source/masks/`,
+   `masks/`, `source/labels/`, or `labels/`.
+2. Runs basic DICOM sanity checks for series UID, modality and instance order.
+3. Computes SHA-256 content hashes.
+4. Skips uploads that already match the current dataset hash indexes.
+5. Uploads through `datasets/<id>/.staging-*` and a `.publish-lock`, then copies
+   into `datasets/<id>/source/...`.
+6. Generates and uploads:
+   - `manifest.yaml`
+   - `indexes/content_hash_index.parquet`
+   - `indexes/masks_content_hash_index.parquet` when masks exist
+   - `metadata/sample_manifests.parquet`
+   - `metadata/samples.parquet`
 
-`publish` can register the resource directly in Opal:
+Use `--dry-run` to scan and show the upload plan without S3 writes, `--no-skip`
+to force uploads, or `--no-atomic` to disable staging.
 
-```bash
-dsimaging-admin --endpoint http://localhost:9000 publish \
-  --dataset-id lung_ct_v1 \
-  --source /data/lung_ct \
-  --metadata /data/lung_ct/clinical.csv \
-  --modality ct \
-  --resource-endpoint http://minio.local:9000 \
-  --opal-url https://opal.example.org \
-  --opal-user administrator \
-  --opal-password "$OPAL_PASSWORD" \
-  --opal-project IMAGING
+## Configuration
+
+`~/.dsimaging.yaml` supports multiple profiles:
+
+```yaml
+default_profile: default
+profiles:
+  default:
+    endpoint: http://127.0.0.1:9000
+    controller_url: http://127.0.0.1:8080
+    bucket: imaging-data
+    access_key: minioadmin
+    secret_key: minioadmin123
+    region: ""
 ```
 
-`--metadata` accepts CSV or Parquet files with a unique `sample_id` column. The
-extra columns are left-joined to discovered imaging samples and stored in
-`metadata/samples.parquet`, so clinical/outcome variables can be loaded later
-with derived radiomics features inside DataSHIELD. `rescan` and the store
-controller preserve these extra metadata columns when rebuilding indexes.
-
-Use `--resource-endpoint` when the upload endpoint and the Rock-visible endpoint
-are different, for example uploading from the Docker host through
-`http://127.0.0.1:9000` while Rocks reach MinIO as `http://minio.local:9000`.
-
-## Environment variables
+Environment variables override profile values:
 
 | Variable | Default | Description |
 |---|---|---|
+| `DSIMAGING_PROFILE` | `default` | Config profile |
 | `DSIMAGING_ENDPOINT` | `http://127.0.0.1:9000` | S3/MinIO endpoint |
+| `DSIMAGING_CONTROLLER_URL` | (empty) | dsimaging-store controller URL |
 | `DSIMAGING_ACCESS_KEY` | `minioadmin` | S3 access key |
 | `DSIMAGING_SECRET_KEY` | `minioadmin123` | S3 secret key |
 | `DSIMAGING_BUCKET` | `imaging-data` | Bucket name |
 | `DSIMAGING_REGION` | (empty) | S3 region |
-| `OPAL_TOKEN` | (empty) | Optional Opal token for `publish --opal-url` |
-| `OPAL_USER` | (empty) | Optional Opal username for `publish --opal-url` |
-| `OPAL_PASSWORD` | (empty) | Optional Opal password for `publish --opal-url` |
-
-## Rescan
-
-`rescan --dataset-id <id>` rebuilds `content_hash_index.parquet`,
-`masks_content_hash_index.parquet` when masks exist, `sample_manifests.parquet`,
-`samples.parquet` and `manifest.yaml` from the current contents of
-`source/images/` and `source/masks/`. This is the same contract maintained
-automatically by the dsimaging-store controller when MinIO webhooks are enabled.
 
 ## Dataset layout in S3
 
-```
+```text
 s3://<bucket>/datasets/<dataset_id>/
   manifest.yaml
   metadata/
@@ -113,3 +135,5 @@ s3://<bucket>/datasets/<dataset_id>/
   derived/
   qc/
 ```
+
+Store creation and dataset management only target dsimaging-store deployments.

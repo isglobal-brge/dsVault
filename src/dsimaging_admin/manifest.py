@@ -78,6 +78,66 @@ def scan_images(source_dir: str) -> list[dict]:
     return samples
 
 
+def validate_dicom_series(source_dir: str) -> list[str]:
+    """Return warnings for basic DICOM series consistency checks.
+
+    The check is intentionally lightweight and metadata-only. If pydicom is not
+    installed, callers get a warning instead of a hard dependency failure.
+    """
+    images_dir = _find_images_dir(source_dir)
+    if not images_dir:
+        return []
+    try:
+        import pydicom
+    except ImportError:
+        return ["pydicom is not installed; DICOM sanity checks were skipped"]
+
+    warnings = []
+    for entry in sorted(os.listdir(images_dir)):
+        series_dir = os.path.join(images_dir, entry)
+        if not os.path.isdir(series_dir):
+            continue
+        dcm_files = sorted(
+            f for f in os.listdir(series_dir) if f.lower().endswith(".dcm")
+        )
+        if not dcm_files:
+            continue
+        series_uids = set()
+        modalities = set()
+        instance_numbers = []
+        unreadable = []
+        for filename in dcm_files:
+            path = os.path.join(series_dir, filename)
+            try:
+                ds = pydicom.dcmread(path, stop_before_pixels=True, force=True)
+            except Exception as e:
+                unreadable.append(f"{filename}: {e}")
+                continue
+            if getattr(ds, "SeriesInstanceUID", None):
+                series_uids.add(str(ds.SeriesInstanceUID))
+            if getattr(ds, "Modality", None):
+                modalities.add(str(ds.Modality))
+            if getattr(ds, "InstanceNumber", None) is not None:
+                try:
+                    instance_numbers.append(int(ds.InstanceNumber))
+                except (TypeError, ValueError):
+                    warnings.append(
+                        f"{entry}: non-integer InstanceNumber in {filename}"
+                    )
+        if unreadable:
+            warnings.append(f"{entry}: unreadable DICOM metadata in {len(unreadable)} file(s)")
+        if len(series_uids) > 1:
+            warnings.append(f"{entry}: multiple SeriesInstanceUID values")
+        if len(modalities) > 1:
+            warnings.append(f"{entry}: multiple Modality values")
+        if instance_numbers:
+            if len(instance_numbers) != len(set(instance_numbers)):
+                warnings.append(f"{entry}: duplicate InstanceNumber values")
+            if instance_numbers != sorted(instance_numbers):
+                warnings.append(f"{entry}: InstanceNumber is not monotonic by filename")
+    return warnings
+
+
 def scan_masks(source_dir: str, sample_ids: list[str] | None = None) -> list[dict]:
     """Scan a local directory for mask files and compute hashes."""
     masks = []
@@ -261,6 +321,17 @@ def write_manifest_yaml(manifest: dict, path: str):
 def build_hash_index(samples: list[dict], bucket: str, prefix: str,
                      source_path: str = "images") -> pa.Table:
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if not samples:
+        return pa.table({
+            "sample_id": pa.array([], type=pa.string()),
+            "uri": pa.array([], type=pa.string()),
+            "content_hash": pa.array([], type=pa.string()),
+            "size": pa.array([], type=pa.int64()),
+            "last_modified": pa.array([], type=pa.string()),
+            "version_id": pa.array([], type=pa.string()),
+            "etag": pa.array([], type=pa.string()),
+            "source_kind": pa.array([], type=pa.string()),
+        })
     return pa.table({
         "sample_id": [s["sample_id"] for s in samples],
         "uri": [
@@ -283,6 +354,15 @@ def build_mask_hash_index(masks: list[dict], bucket: str, prefix: str) -> pa.Tab
 
 
 def build_sample_manifests(samples: list[dict]) -> pa.Table:
+    if not samples:
+        return pa.table({
+            "sample_id": pa.array([], type=pa.string()),
+            "source_kind": pa.array([], type=pa.string()),
+            "primary_uri": pa.array([], type=pa.string()),
+            "files_json": pa.array([], type=pa.string()),
+            "content_hash": pa.array([], type=pa.string()),
+            "n_files": pa.array([], type=pa.int32()),
+        })
     return pa.table({
         "sample_id": [s["sample_id"] for s in samples],
         "source_kind": [s["source_kind"] for s in samples],
@@ -304,6 +384,15 @@ def build_samples_metadata(samples: list[dict],
     image samples become nulls. This keeps the manifest image-led while allowing
     clinical/outcome variables to travel with the dataset.
     """
+    if not samples:
+        base = pa.table({
+            "sample_id": pa.array([], type=pa.string()),
+            "source_kind": pa.array([], type=pa.string()),
+            "n_files": pa.array([], type=pa.int32()),
+        })
+        if extra_metadata is None:
+            return base
+        return _left_join_metadata(base, extra_metadata)
     base = pa.table({
         "sample_id": [s["sample_id"] for s in samples],
         "source_kind": [s["source_kind"] for s in samples],
