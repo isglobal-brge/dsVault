@@ -11,8 +11,8 @@ pip install dsimaging-admin
 
 ## Create a store
 
-`dsimaging-admin store init` writes a Docker Compose project for MinIO plus the
-`dsimaging-store` controller.
+`dsimaging-admin store init` provisions the configured backend. With MinIO it
+writes a Docker Compose project for MinIO plus the `dsimaging-store` controller:
 
 ```bash
 dsimaging-admin store init ./study-store \
@@ -30,6 +30,21 @@ dsimaging-admin store init ./study-store \
 dsimaging-admin store up ./study-store
 ```
 
+With AWS it creates and wires the S3 data plane and SQS notification plane. It
+uses boto3's default credential chain unless `--access-key` and `--secret-key`
+are supplied explicitly:
+
+```bash
+dsimaging-admin --backend aws --region eu-west-1 --bucket my-imaging \
+  store init --kms-key arn:aws:kms:eu-west-1:111122223333:key/...
+```
+
+If `--kms-key` is omitted, the bucket uses SSE-S3 (`AES256`). The AWS path needs
+IAM permissions for `s3:CreateBucket`, `s3:PutBucketVersioning`,
+`s3:PutBucketEncryption`, `s3:PutBucketNotification`, `sqs:CreateQueue` and
+`sqs:SetQueueAttributes`. The resolved SQS queue URL is saved under
+`aws.sqs_queue_url` in `~/.dsimaging.yaml`.
+
 Use the generated connection details as a reusable CLI profile:
 
 ```bash
@@ -43,24 +58,32 @@ dsimaging-admin init \
 
 ```bash
 # Publish with staging, publish lock, skip-if-hash-matches and DICOM checks.
-dsimaging-admin publish \
+dsimaging-admin dataset publish \
   --dataset-id study_ct_v1 \
   --source /data/study_ct \
   --metadata /data/study_ct/clinical.csv \
   --modality ct
 
 # Inspect and verify.
-dsimaging-admin list
-dsimaging-admin status study_ct_v1
-dsimaging-admin verify study_ct_v1
+dsimaging-admin dataset list
+dsimaging-admin dataset status study_ct_v1
+dsimaging-admin dataset verify study_ct_v1
 dsimaging-admin doctor
 
-# Rebuild artifacts from S3, copy, download or delete.
-dsimaging-admin rescan study_ct_v1
-dsimaging-admin copy study_ct_v1 study_ct_v2 --yes
-dsimaging-admin download study_ct_v1 ./debug/study_ct_v1
-dsimaging-admin delete study_ct_v1 --yes --purge-versions
+# Modify, rebuild artifacts from S3, copy, download or delete.
+dsimaging-admin dataset modify study_ct_v1 \
+  --metadata /data/study_ct/clinical_v2.csv \
+  --add-images /data/study_ct/new_images \
+  --yes
+dsimaging-admin dataset rescan study_ct_v1
+dsimaging-admin dataset copy study_ct_v1 study_ct_v2 --yes
+dsimaging-admin dataset download study_ct_v1 ./debug/study_ct_v1
+dsimaging-admin dataset delete study_ct_v1 --yes --purge-versions
 ```
+
+The former top-level dataset commands (`publish`, `list`, `status`, `verify`,
+`delete`, `download`, `copy`, `rescan`, `reconcile`) remain as deprecated aliases
+and print a warning before delegating to the `dataset` subgroup.
 
 ## Local operator UI
 
@@ -85,9 +108,9 @@ refresh button.
 All reporting commands that are useful for automation support JSON output:
 
 ```bash
-dsimaging-admin list --output json
-dsimaging-admin status study_ct_v1 --output json
-dsimaging-admin verify study_ct_v1 --output json
+dsimaging-admin dataset list --output json
+dsimaging-admin dataset status study_ct_v1 --output json
+dsimaging-admin dataset verify study_ct_v1 --output json
 dsimaging-admin doctor --output json
 ```
 
@@ -110,6 +133,12 @@ dsimaging-admin doctor --output json
 Use `--dry-run` to scan and show the upload plan without S3 writes, `--no-skip`
 to force uploads, or `--no-atomic` to disable staging.
 
+`dataset modify` never deletes existing objects. `--metadata` validates and
+replaces the metadata parquet after confirmation, `--add-images` and
+`--add-masks` upload new content-addressed objects when the current hash indexes
+do not already contain them, then the dataset indexes and manifest are rebuilt
+from S3. Use `--dry-run` to list planned uploads without writing.
+
 ## Configuration
 
 `~/.dsimaging.yaml` supports multiple profiles:
@@ -118,12 +147,15 @@ to force uploads, or `--no-atomic` to disable staging.
 default_profile: default
 profiles:
   default:
+    backend: auto
     endpoint: http://127.0.0.1:9000
     controller_url: http://127.0.0.1:8080
     bucket: imaging-data
     access_key: minioadmin
     secret_key: minioadmin123
     region: ""
+    aws:
+      sqs_queue_url: ""
 ```
 
 Environment variables override profile values:
@@ -137,6 +169,7 @@ Environment variables override profile values:
 | `DSIMAGING_SECRET_KEY` | `minioadmin123` | S3 secret key |
 | `DSIMAGING_BUCKET` | `imaging-data` | Bucket name |
 | `DSIMAGING_REGION` | (empty) | S3 region |
+| `DSIMAGING_BACKEND` | `auto` | Backend override: `auto`, `minio`, `aws` or `s3-compatible` |
 
 ## Dataset layout in S3
 

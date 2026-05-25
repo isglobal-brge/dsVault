@@ -1,6 +1,10 @@
 """S3/MinIO client helpers."""
 
+import json
+import re
+
 import boto3
+from botocore.exceptions import ClientError
 from botocore.config import Config
 from urllib.parse import urlparse
 
@@ -43,6 +47,70 @@ def create_client(endpoint: str | None, access_key: str | None = None,
         kwargs["aws_secret_access_key"] = secret_key
 
     return boto3.client("s3", config=Config(signature_version="s3v4"), **kwargs)
+
+
+def create_sqs_client(access_key: str | None = None,
+                      secret_key: str | None = None,
+                      region: str = "") -> boto3.client:
+    """Create a boto3 SQS client, preserving the default credential chain."""
+    kwargs = {"region_name": region or "us-east-1"}
+    if access_key:
+        kwargs["aws_access_key_id"] = access_key
+    if secret_key:
+        kwargs["aws_secret_access_key"] = secret_key
+    return boto3.client("sqs", **kwargs)
+
+
+def provision_aws_store(endpoint: str | None, bucket: str, region: str = "",
+                        access_key: str | None = None,
+                        secret_key: str | None = None,
+                        kms_key: str | None = None,
+                        s3_client=None, sqs_client=None) -> dict:
+    """Provision an AWS S3-backed dsimaging store and SQS event queue.
+
+    The operation is idempotent and returns a structured report with one row
+    per provisioning step plus the resolved SQS queue URL and ARN.
+    """
+    region = region or "us-east-1"
+    s3 = s3_client or create_client(endpoint or None, access_key, secret_key, region)
+    sqs = sqs_client or create_sqs_client(access_key, secret_key, region)
+    steps: list[dict] = []
+
+    def step(name: str, status: str, detail: str) -> None:
+        steps.append({"name": name, "status": status, "detail": detail})
+
+    _ensure_bucket(s3, bucket, region, step)
+    _ensure_bucket_versioning(s3, bucket, step)
+    _ensure_bucket_encryption(s3, bucket, kms_key, step)
+    queue_name = _event_queue_name(bucket)
+    queue_url, queue_arn, queue_created = _ensure_sqs_queue(sqs, queue_name)
+    step(
+        "sqs_queue",
+        "ok" if queue_created else "skipped",
+        f"{queue_name} -> {queue_url}",
+    )
+    policy_changed = _ensure_sqs_policy(sqs, queue_url, queue_arn, bucket)
+    step(
+        "sqs_policy",
+        "ok" if policy_changed else "skipped",
+        f"bucket arn:aws:s3:::{bucket} allowed to send messages",
+    )
+    notification_changed = _ensure_bucket_notification(s3, bucket, queue_arn)
+    step(
+        "bucket_notification",
+        "ok" if notification_changed else "skipped",
+        f"s3:ObjectCreated:* and s3:ObjectRemoved:* -> {queue_arn}",
+    )
+    return {
+        "backend": "aws",
+        "bucket": bucket,
+        "region": region,
+        "sqs_queue_name": queue_name,
+        "sqs_queue_url": queue_url,
+        "sqs_queue_arn": queue_arn,
+        "steps": steps,
+        "ok": all(item["status"] in ("ok", "skipped") for item in steps),
+    }
 
 
 def list_datasets(s3, bucket: str) -> list[dict]:
@@ -188,6 +256,208 @@ def parse_s3_uri(uri: str) -> tuple[str, str]:
     if parsed.scheme != "s3" or not parsed.netloc:
         raise ValueError(f"not an S3 URI: {uri}")
     return parsed.netloc, parsed.path.lstrip("/")
+
+
+def _client_error_code(exc: Exception) -> str:
+    if isinstance(exc, ClientError):
+        return str(exc.response.get("Error", {}).get("Code", ""))
+    return ""
+
+
+def _ensure_bucket(s3, bucket: str, region: str, step) -> None:
+    try:
+        s3.head_bucket(Bucket=bucket)
+        step("bucket", "skipped", f"{bucket} already exists")
+        return
+    except Exception as e:
+        code = _client_error_code(e)
+        if code and code not in ("404", "NoSuchBucket", "NotFound"):
+            # Some clients use 403 for existing buckets without access. Surface
+            # that as a failure instead of masking a permissions problem.
+            if code in ("403", "AccessDenied"):
+                raise
+    kwargs = {"Bucket": bucket}
+    if region != "us-east-1":
+        kwargs["CreateBucketConfiguration"] = {"LocationConstraint": region}
+    s3.create_bucket(**kwargs)
+    step("bucket", "ok", f"{bucket} created")
+
+
+def _ensure_bucket_versioning(s3, bucket: str, step) -> None:
+    current = s3.get_bucket_versioning(Bucket=bucket).get("Status")
+    if current == "Enabled":
+        step("versioning", "skipped", "already enabled")
+        return
+    s3.put_bucket_versioning(
+        Bucket=bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+    step("versioning", "ok", "enabled")
+
+
+def _ensure_bucket_encryption(s3, bucket: str, kms_key: str | None, step) -> None:
+    desired = (
+        {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": kms_key}
+        if kms_key else {"SSEAlgorithm": "AES256"}
+    )
+    current = None
+    try:
+        config = s3.get_bucket_encryption(Bucket=bucket)
+        rules = config.get("ServerSideEncryptionConfiguration", {}).get("Rules", [])
+        if rules:
+            current = rules[0].get("ApplyServerSideEncryptionByDefault", {})
+    except Exception as e:
+        code = _client_error_code(e)
+        if code not in (
+            "ServerSideEncryptionConfigurationNotFoundError",
+            "NoSuchBucket",
+            "404",
+        ):
+            raise
+    if current and _encryption_matches(current, desired):
+        step("encryption", "skipped", "already configured")
+        return
+    config = {
+        "Rules": [{
+            "ApplyServerSideEncryptionByDefault": desired,
+        }],
+    }
+    s3.put_bucket_encryption(
+        Bucket=bucket,
+        ServerSideEncryptionConfiguration=config,
+    )
+    step(
+        "encryption",
+        "ok",
+        "SSE-KMS configured" if kms_key else "SSE-S3 AES256 configured",
+    )
+
+
+def _encryption_matches(current: dict, desired: dict) -> bool:
+    if current.get("SSEAlgorithm") != desired.get("SSEAlgorithm"):
+        return False
+    if desired.get("SSEAlgorithm") == "aws:kms":
+        return current.get("KMSMasterKeyID") == desired.get("KMSMasterKeyID")
+    return True
+
+
+def _event_queue_name(bucket: str) -> str:
+    safe_bucket = re.sub(r"[^A-Za-z0-9_-]", "-", bucket)
+    return f"dsimaging-store-{safe_bucket}-events"[:80]
+
+
+def _ensure_sqs_queue(sqs, queue_name: str) -> tuple[str, str, bool]:
+    created = False
+    try:
+        queue_url = sqs.get_queue_url(QueueName=queue_name)["QueueUrl"]
+    except Exception as e:
+        code = _client_error_code(e)
+        if code and code not in ("AWS.SimpleQueueService.NonExistentQueue", "QueueDoesNotExist"):
+            raise
+        queue_url = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+        created = True
+    attrs = sqs.get_queue_attributes(
+        QueueUrl=queue_url,
+        AttributeNames=["QueueArn"],
+    )["Attributes"]
+    return queue_url, attrs["QueueArn"], created
+
+
+def _ensure_sqs_policy(sqs, queue_url: str, queue_arn: str, bucket: str) -> bool:
+    attrs = sqs.get_queue_attributes(
+        QueueUrl=queue_url,
+        AttributeNames=["Policy"],
+    ).get("Attributes", {})
+    policy = _load_policy(attrs.get("Policy"))
+    policy.setdefault("Version", "2012-10-17")
+    statements = policy.setdefault("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+        policy["Statement"] = statements
+    sid = f"DsimagingStoreS3Events{re.sub(r'[^A-Za-z0-9]', '', bucket)[:40]}"
+    statement = {
+        "Sid": sid,
+        "Effect": "Allow",
+        "Principal": {"Service": "s3.amazonaws.com"},
+        "Action": "SQS:SendMessage",
+        "Resource": queue_arn,
+        "Condition": {"ArnEquals": {"aws:SourceArn": f"arn:aws:s3:::{bucket}"}},
+    }
+    for i, existing in enumerate(statements):
+        if existing.get("Sid") == sid:
+            if existing == statement:
+                return False
+            statements[i] = statement
+            sqs.set_queue_attributes(
+                QueueUrl=queue_url,
+                Attributes={"Policy": json.dumps(policy, sort_keys=True)},
+            )
+            return True
+    statements.append(statement)
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(policy, sort_keys=True)},
+    )
+    return True
+
+
+def _load_policy(raw: str | None) -> dict:
+    if not raw:
+        return {"Version": "2012-10-17", "Statement": []}
+    try:
+        policy = json.loads(raw)
+    except Exception:
+        return {"Version": "2012-10-17", "Statement": []}
+    if not isinstance(policy, dict):
+        return {"Version": "2012-10-17", "Statement": []}
+    return policy
+
+
+def _ensure_bucket_notification(s3, bucket: str, queue_arn: str) -> bool:
+    current = s3.get_bucket_notification_configuration(Bucket=bucket)
+    notification = _clean_notification_config(current)
+    queues = [
+        item for item in notification.get("QueueConfigurations", [])
+        if item.get("QueueArn") != queue_arn
+    ]
+    desired = {
+        "Id": "dsimaging-store-events",
+        "QueueArn": queue_arn,
+        "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
+    }
+    if len(queues) != len(notification.get("QueueConfigurations", [])):
+        existing = [
+            item for item in notification.get("QueueConfigurations", [])
+            if item.get("QueueArn") == queue_arn
+        ][0]
+        if _queue_notification_matches(existing, desired):
+            return False
+    queues.append(desired)
+    notification["QueueConfigurations"] = queues
+    s3.put_bucket_notification_configuration(
+        Bucket=bucket,
+        NotificationConfiguration=notification,
+    )
+    return True
+
+
+def _clean_notification_config(config: dict) -> dict:
+    allowed = (
+        "TopicConfigurations",
+        "QueueConfigurations",
+        "LambdaFunctionConfigurations",
+        "EventBridgeConfiguration",
+    )
+    return {key: value for key, value in config.items() if key in allowed and value}
+
+
+def _queue_notification_matches(current: dict, desired: dict) -> bool:
+    return (
+        current.get("QueueArn") == desired["QueueArn"]
+        and sorted(current.get("Events", [])) == sorted(desired["Events"])
+        and current.get("Id") == desired["Id"]
+        and not current.get("Filter")
+    )
 
 
 def _object_exists(s3, bucket: str, key: str) -> bool:

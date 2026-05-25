@@ -18,11 +18,13 @@ from .s3 import (
     create_client,
     delete_keys,
     delete_object_versions,
+    detect_backend,
     get_object_bytes,
     head_object,
     list_datasets,
     list_object_versions,
     list_objects,
+    provision_aws_store,
     put_object_bytes,
 )
 from .manifest import (
@@ -111,8 +113,87 @@ def _resolve(cli_value: str | None, envvar: str, cfg: dict,
     return fallback
 
 
+def _resolve_optional(cli_value: str | None, envvar: str, cfg: dict,
+                      key: str) -> str | None:
+    if cli_value not in (None, ""):
+        return str(cli_value)
+    val = os.environ.get(envvar, "")
+    if val:
+        return val
+    val = cfg.get(key, "")
+    if val not in (None, ""):
+        return str(val)
+    return None
+
+
+def _resolve_backend(cli_value: str | None, cfg: dict) -> str:
+    if cli_value not in (None, ""):
+        return str(cli_value)
+    val = os.environ.get("DSIMAGING_BACKEND", "")
+    if val:
+        return val
+    val = cfg.get("backend", "")
+    if val:
+        return str(val)
+    return "auto"
+
+
+def _persist_aws_queue_url(profile: str, queue_url: str, bucket: str | None = None,
+                           region: str | None = None,
+                           endpoint: str | None = None) -> None:
+    data = _load_all_config()
+    if "profiles" in data and isinstance(data["profiles"], dict):
+        profiles = data.setdefault("profiles", {})
+        target = profiles.setdefault(profile or data.get("default_profile") or "default", {})
+        data.setdefault("default_profile", profile or data.get("default_profile") or "default")
+    else:
+        profile_name = profile or "default"
+        existing = data.get("default", data) if data else {}
+        data = {"default_profile": profile_name, "profiles": {profile_name: existing}}
+        target = data["profiles"][profile_name]
+    target["backend"] = "aws"
+    if bucket:
+        target["bucket"] = bucket
+    if region:
+        target["region"] = region
+    if endpoint:
+        target["endpoint"] = endpoint
+    target.setdefault("aws", {})["sqs_queue_url"] = queue_url
+    import yaml
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+    os.chmod(CONFIG_PATH, 0o600)
+
+
 def _echo_json(payload: dict | list) -> None:
     click.echo(json.dumps(payload, indent=2, sort_keys=True, default=str))
+
+
+def _warn_dataset_alias(command: str) -> None:
+    click.echo(
+        f"dsimaging-admin {command}: deprecated; "
+        f"use 'dsimaging-admin dataset {command}' instead",
+        err=True,
+    )
+
+
+class _DeprecatedDatasetAlias(click.Command):
+    def __init__(self, target: click.Command, alias_name: str):
+        super().__init__(
+            name=alias_name,
+            params=target.params,
+            callback=target.callback,
+            help=(target.help or "").rstrip()
+            + "\n\nDeprecated alias; use "
+            + f"'dsimaging-admin dataset {alias_name}' instead.",
+            short_help=f"Deprecated alias for dataset {alias_name}.",
+            context_settings=target.context_settings,
+        )
+        self._alias_name = alias_name
+
+    def invoke(self, ctx):
+        _warn_dataset_alias(self._alias_name)
+        return super().invoke(ctx)
 
 
 @click.group()
@@ -128,17 +209,27 @@ def _echo_json(payload: dict | list) -> None:
               help="dsimaging-store controller URL")
 @click.option("--skip-controller", is_flag=True,
               help="Do not call the dsimaging-store controller")
+@click.option("--backend",
+              type=click.Choice(["auto", "minio", "aws", "s3-compatible"]),
+              default=None,
+              help="Storage backend override")
 @click.pass_context
 def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
-         controller_url, skip_controller):
+         controller_url, skip_controller, backend):
     """Admin CLI for managing dsimaging-store deployments and datasets."""
     cfg = _load_config(profile)
-    endpoint = _resolve(endpoint, "DSIMAGING_ENDPOINT", cfg, "endpoint",
-                        "http://127.0.0.1:9000")
-    access_key = _resolve(access_key, "DSIMAGING_ACCESS_KEY", cfg, "access_key",
-                          "minioadmin")
-    secret_key = _resolve(secret_key, "DSIMAGING_SECRET_KEY", cfg, "secret_key",
-                          "minioadmin123")
+    backend = _resolve_backend(backend, cfg)
+    raw_endpoint = _resolve_optional(endpoint, "DSIMAGING_ENDPOINT", cfg, "endpoint")
+    endpoint = raw_endpoint or ("" if backend == "aws" else "http://127.0.0.1:9000")
+    resolved_backend, backend_rationale = detect_backend(endpoint or None, backend)
+    if resolved_backend == "aws":
+        access_key = _resolve_optional(access_key, "DSIMAGING_ACCESS_KEY", cfg, "access_key")
+        secret_key = _resolve_optional(secret_key, "DSIMAGING_SECRET_KEY", cfg, "secret_key")
+    else:
+        access_key = _resolve(access_key, "DSIMAGING_ACCESS_KEY", cfg, "access_key",
+                              "minioadmin")
+        secret_key = _resolve(secret_key, "DSIMAGING_SECRET_KEY", cfg, "secret_key",
+                              "minioadmin123")
     bucket = _resolve(bucket, "DSIMAGING_BUCKET", cfg, "bucket", "imaging-data")
     region = _resolve(region, "DSIMAGING_REGION", cfg, "region", "")
     controller_url = _resolve(controller_url, "DSIMAGING_CONTROLLER_URL", cfg,
@@ -151,6 +242,8 @@ def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
     ctx.obj["access_key"] = access_key
     ctx.obj["secret_key"] = secret_key
     ctx.obj["region"] = region
+    ctx.obj["backend"] = resolved_backend
+    ctx.obj["backend_rationale"] = backend_rationale
     ctx.obj["profile"] = profile
     ctx.obj["controller_url"] = controller_url
     ctx.obj["skip_controller"] = skip_controller
@@ -185,6 +278,11 @@ def store_group():
     """Create and operate local dsimaging-store Compose projects."""
 
 
+@main.group("dataset")
+def dataset_group():
+    """Manage datasets inside an imaging store."""
+
+
 @main.group("ui")
 def ui_group():
     """Launch the local operator dashboard."""
@@ -213,23 +311,74 @@ def ui_launch(host, port, open_browser):
 
 
 @store_group.command("init")
-@click.argument("path", type=click.Path(file_okay=False))
+@click.argument("path", required=False, default=".", type=click.Path(file_okay=False))
 @click.option("--force", is_flag=True, help="Overwrite generated store files")
 @click.option("--controller-image", default=DEFAULT_CONTROLLER_IMAGE,
               show_default=True, help="Controller image for image-based stores")
 @click.option("--store-source", default=None, type=click.Path(file_okay=False),
               help="Use a local dsimaging-store checkout for controller builds")
-@click.option("--access-key", default="minioadmin", show_default=True)
-@click.option("--secret-key", default="minioadmin123", show_default=True)
-@click.option("--bucket", default="imaging-data", show_default=True)
+@click.option("--backend", type=click.Choice(["auto", "minio", "aws", "s3-compatible"]),
+              default=None, help="Backend override for provisioning")
+@click.option("--kms-key", default=None,
+              help="AWS KMS key ARN for SSE-KMS; empty uses SSE-S3 AES256")
+@click.option("--access-key", default=None, help="S3 access key override")
+@click.option("--secret-key", default=None, help="S3 secret key override")
+@click.option("--bucket", default=None, help="Bucket name override")
 @click.option("--minio-port", default=9000, show_default=True)
 @click.option("--console-port", default=9001, show_default=True)
 @click.option("--controller-port", default=8080, show_default=True)
 @click.option("--reconcile-interval", default=10, show_default=True)
-def store_init(path, force, controller_image, store_source, access_key, secret_key,
-               bucket, minio_port, console_port, controller_port,
+@click.pass_context
+def store_init(ctx, path, force, controller_image, store_source, backend, kms_key,
+               access_key, secret_key, bucket, minio_port, console_port,
+               controller_port,
                reconcile_interval):
-    """Generate a dsimaging-store project directory."""
+    """Provision a store: MinIO Compose locally, or AWS S3/SQS on AWS.
+
+    AWS mode requires IAM permissions for s3:CreateBucket,
+    s3:PutBucketVersioning, s3:PutBucketEncryption,
+    s3:PutBucketNotification, sqs:CreateQueue and sqs:SetQueueAttributes.
+    """
+    bucket = bucket or ctx.obj["bucket"]
+    backend_override = backend or ctx.obj.get("backend") or "auto"
+    resolved_backend, rationale = detect_backend(ctx.obj.get("endpoint") or None,
+                                                 backend_override)
+    if resolved_backend == "aws":
+        aws_endpoint = ctx.obj.get("endpoint") or None
+        if aws_endpoint and "amazonaws.com" not in aws_endpoint.lower():
+            aws_endpoint = None
+        try:
+            report = provision_aws_store(
+                aws_endpoint,
+                bucket,
+                region=ctx.obj.get("region") or "us-east-1",
+                access_key=access_key if access_key not in (None, "") else ctx.obj.get("access_key"),
+                secret_key=secret_key if secret_key not in (None, "") else ctx.obj.get("secret_key"),
+                kms_key=kms_key,
+            )
+        except Exception as e:
+            raise click.ClickException(str(e)) from e
+        click.echo("AWS store provisioning")
+        click.echo(f"  Backend: {resolved_backend} ({rationale})")
+        click.echo(f"  Bucket:  {bucket}")
+        click.echo(f"  Region:  {report['region']}")
+        for step in report["steps"]:
+            color = "green" if step["status"] == "ok" else "yellow"
+            click.echo(
+                f"  {click.style(step['status'].upper(), fg=color)} "
+                f"{step['name']}: {step['detail']}"
+            )
+        if report.get("sqs_queue_url"):
+            _persist_aws_queue_url(ctx.obj.get("profile") or "default",
+                                   report["sqs_queue_url"],
+                                   bucket=bucket,
+                                   region=report["region"],
+                                   endpoint=aws_endpoint)
+            click.echo(f"  SQS queue URL saved to {CONFIG_PATH}")
+        return
+
+    access_key = access_key or ctx.obj.get("access_key") or "minioadmin"
+    secret_key = secret_key or ctx.obj.get("secret_key") or "minioadmin123"
     try:
         cfg = init_store(
             path,
@@ -321,7 +470,7 @@ def store_doctor_cmd(path, output):
         raise click.ClickException("store health check failed")
 
 
-@main.command()
+@dataset_group.command("publish")
 @click.option("--dataset-id", required=True, help="Dataset identifier")
 @click.option("--source", required=True, type=click.Path(exists=True),
               help="Local directory containing images")
@@ -403,7 +552,7 @@ def publish(ctx, dataset_id, source, metadata, modality, atomic, no_skip, dry_ru
     click.echo(f"  Masks:    {len(masks)}")
 
 
-@main.command("list")
+@dataset_group.command("list")
 @click.option("--output", type=click.Choice(["text", "json"]), default="text")
 @click.option("--controller-url", default=None, help="Override controller URL")
 @click.option("--skip-controller", is_flag=True, help="Use S3 only")
@@ -463,7 +612,7 @@ def doctor(ctx, controller_url, skip_controller, output):
         raise click.ClickException("health check failed")
 
 
-@main.command()
+@dataset_group.command("status")
 @click.argument("dataset_id")
 @click.option("--controller-url", default=None, help="Override controller URL")
 @click.option("--skip-controller", is_flag=True, help="Skip controller state")
@@ -495,7 +644,7 @@ def status(ctx, dataset_id, controller_url, skip_controller, output):
             click.echo(f"  Last error:   {ctrl['last_error']}")
 
 
-@main.command("verify")
+@dataset_group.command("verify")
 @click.argument("dataset_id")
 @click.option("--sample-fraction", default=1.0, show_default=True, type=float)
 @click.option("--quick", is_flag=True, help="Trust unchanged S3 ETags as a quick check")
@@ -529,7 +678,7 @@ def verify_cmd(ctx, dataset_id, sample_fraction, quick, output):
         sys.exit(2)
 
 
-@main.command("delete")
+@dataset_group.command("delete")
 @click.argument("dataset_id")
 @click.option("--yes", is_flag=True, help="Confirm deletion")
 @click.option("--purge-versions", is_flag=True,
@@ -555,7 +704,7 @@ def delete_cmd(ctx, dataset_id, yes, purge_versions):
         click.echo(f"  Versions/delete markers: {version_deleted}")
 
 
-@main.command()
+@dataset_group.command("download")
 @click.argument("dataset_id")
 @click.argument("dest", type=click.Path(file_okay=False))
 @click.option("--overwrite", is_flag=True, help="Overwrite existing local files")
@@ -580,7 +729,7 @@ def download(ctx, dataset_id, dest, overwrite):
     click.echo(click.style(f"Downloaded {len(objects)} object(s) to {root}", fg="green"))
 
 
-@main.command("copy")
+@dataset_group.command("copy")
 @click.argument("src_id")
 @click.argument("dst_id")
 @click.option("--yes", is_flag=True, help="Confirm copy")
@@ -622,36 +771,21 @@ def copy_cmd(ctx, src_id, dst_id, yes, replace):
     click.echo(f"  Masks:          {len(masks)}")
 
 
-@main.command()
+@dataset_group.command("rescan")
 @click.argument("dataset_id")
 @click.pass_context
 def rescan(ctx, dataset_id):
     """Re-scan and update indexes for a dataset from current S3 contents."""
     _validate_dataset_cli(dataset_id)
-    s3 = ctx.obj["s3"]
-    bucket = ctx.obj["bucket"]
-    prefix = f"datasets/{dataset_id}"
-
     click.echo(f"Rescanning: {dataset_id}")
-    objects = list_objects(s3, bucket, f"{prefix}/source/images/")
-    click.echo(f"  Found {len(objects)} objects under source/images/")
-    mask_objects = list_objects(s3, bucket, f"{prefix}/source/masks/")
-    click.echo(f"  Found {len(mask_objects)} objects under source/masks/")
-
-    samples = scan_s3_images(s3, bucket, prefix, objects)
-    if not samples:
-        raise click.ClickException("No supported image objects found.")
-    masks = scan_s3_masks(s3, bucket, prefix, mask_objects,
-                          sample_ids=[sample["sample_id"] for sample in samples])
-    modality = _existing_modality(s3, bucket, prefix, fallback="unknown")
-    extra_metadata = _read_existing_samples_metadata(s3, bucket, prefix)
-    _write_dataset_artifacts(s3, bucket, prefix, dataset_id, modality, samples,
-                             masks=masks, extra_metadata=extra_metadata)
-    click.echo(f"  Index updated: {len(samples)} samples, {len(masks)} masks")
+    counts = _rescan_dataset_artifacts(ctx.obj["s3"], ctx.obj["bucket"], dataset_id)
+    click.echo(f"  Found {counts['objects']} objects under source/images/")
+    click.echo(f"  Found {counts['mask_objects']} objects under source/masks/")
+    click.echo(f"  Index updated: {counts['samples']} samples, {counts['masks']} masks")
     click.echo(click.style("Rescan complete.", fg="green"))
 
 
-@main.command()
+@dataset_group.command("reconcile")
 @click.argument("dataset_id")
 @click.option("--controller-url", default=None, help="Override controller URL")
 @click.pass_context
@@ -668,6 +802,107 @@ def reconcile(ctx, dataset_id, controller_url):
     _echo_json(payload)
 
 
+for _dataset_alias_name, _dataset_alias_command in {
+    "publish": publish,
+    "list": list_cmd,
+    "status": status,
+    "verify": verify_cmd,
+    "delete": delete_cmd,
+    "download": download,
+    "copy": copy_cmd,
+    "rescan": rescan,
+    "reconcile": reconcile,
+}.items():
+    main.add_command(
+        _DeprecatedDatasetAlias(_dataset_alias_command, _dataset_alias_name),
+        _dataset_alias_name,
+    )
+
+
+@dataset_group.command("modify")
+@click.argument("dataset_id")
+@click.option("--metadata", default=None, type=click.Path(exists=True, dir_okay=False),
+              help="Replace metadata/samples.parquet from a CSV/Parquet file")
+@click.option("--add-images", default=None, type=click.Path(exists=True, file_okay=False),
+              help="Add image objects from a local directory")
+@click.option("--add-masks", default=None, type=click.Path(exists=True, file_okay=False),
+              help="Add mask objects from a local directory")
+@click.option("--dry-run", is_flag=True, help="Plan changes without uploading or rewriting indexes")
+@click.option("--yes", is_flag=True,
+              help="Confirm metadata replacement without an interactive prompt")
+@click.pass_context
+def modify(ctx, dataset_id, metadata, add_images, add_masks, dry_run, yes):
+    """Modify an existing dataset without deleting current objects."""
+    _validate_dataset_cli(dataset_id)
+    if not any([metadata, add_images, add_masks]):
+        raise click.ClickException("Provide --metadata, --add-images or --add-masks")
+
+    s3 = ctx.obj["s3"]
+    bucket = ctx.obj["bucket"]
+    prefix = f"datasets/{dataset_id}"
+    if not head_object(s3, bucket, f"{prefix}/manifest.yaml"):
+        raise click.ClickException(f"Dataset '{dataset_id}' is not published")
+
+    extra_metadata = None
+    if metadata:
+        try:
+            extra_metadata = read_metadata_table(metadata)
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
+        metadata_exists = bool(head_object(s3, bucket, f"{prefix}/metadata/samples.parquet"))
+        if metadata_exists and not (yes or dry_run):
+            click.confirm(
+                f"Replace metadata for dataset '{dataset_id}'?",
+                abort=True,
+            )
+
+    sample_uploads: list[dict] = []
+    sample_skips: list[dict] = []
+    mask_uploads: list[dict] = []
+    mask_skips: list[dict] = []
+    if add_images:
+        samples = scan_images(add_images)
+        sample_uploads, sample_skips = _partition_uploads(
+            s3, bucket, prefix, samples, source_path="images", enabled=True
+        )
+    if add_masks:
+        existing_objects = list_objects(s3, bucket, f"{prefix}/source/images/")
+        existing_samples = scan_s3_images(s3, bucket, prefix, existing_objects)
+        sample_ids = [sample["sample_id"] for sample in existing_samples]
+        local_sample_ids = [sample["sample_id"] for sample in sample_uploads + sample_skips]
+        masks = scan_masks(add_masks, sample_ids=sample_ids + local_sample_ids)
+        mask_uploads, mask_skips = _partition_uploads(
+            s3, bucket, prefix, masks, source_path="masks", enabled=True
+        )
+
+    click.echo(f"Modifying dataset: {dataset_id}")
+    if metadata:
+        click.echo(f"  Metadata replacement: {os.path.abspath(metadata)}")
+    click.echo(f"  Images to upload: {len(sample_uploads)}; skipped: {len(sample_skips)}")
+    click.echo(f"  Masks to upload:  {len(mask_uploads)}; skipped: {len(mask_skips)}")
+    if dry_run:
+        for sample in sample_uploads[:50]:
+            click.echo(f"  would upload image: {sample['sample_id']}")
+        for mask in mask_uploads[:50]:
+            click.echo(f"  would upload mask: {mask['sample_id']}:{mask['primary_filename']}")
+        click.echo(click.style("Dry run complete; no S3 writes performed.", fg="green"))
+        return
+
+    for sample in sample_uploads:
+        _upload_sample(s3, bucket, prefix, sample, "images")
+    for mask in mask_uploads:
+        _upload_sample(s3, bucket, prefix, mask, "masks")
+    counts = _rescan_dataset_artifacts(s3, bucket, dataset_id,
+                                       extra_metadata=extra_metadata)
+    click.echo(
+        click.style(
+            f"Dataset '{dataset_id}' modified: "
+            f"{counts['samples']} samples, {counts['masks']} masks indexed.",
+            fg="green",
+        )
+    )
+
+
 def _echo_command_output(output: str) -> None:
     if output:
         click.echo(output)
@@ -678,6 +913,29 @@ def _validate_dataset_cli(dataset_id: str) -> None:
         validate_dataset_id(dataset_id)
     except ValueError as e:
         raise click.ClickException(str(e)) from e
+
+
+def _rescan_dataset_artifacts(s3, bucket: str, dataset_id: str,
+                              extra_metadata=None) -> dict:
+    prefix = f"datasets/{dataset_id}"
+    objects = list_objects(s3, bucket, f"{prefix}/source/images/")
+    mask_objects = list_objects(s3, bucket, f"{prefix}/source/masks/")
+    samples = scan_s3_images(s3, bucket, prefix, objects)
+    if not samples:
+        raise click.ClickException("No supported image objects found.")
+    masks = scan_s3_masks(s3, bucket, prefix, mask_objects,
+                          sample_ids=[sample["sample_id"] for sample in samples])
+    modality = _existing_modality(s3, bucket, prefix, fallback="unknown")
+    if extra_metadata is None:
+        extra_metadata = _read_existing_samples_metadata(s3, bucket, prefix)
+    _write_dataset_artifacts(s3, bucket, prefix, dataset_id, modality, samples,
+                             masks=masks, extra_metadata=extra_metadata)
+    return {
+        "objects": len(objects),
+        "mask_objects": len(mask_objects),
+        "samples": len(samples),
+        "masks": len(masks),
+    }
 
 
 def _partition_uploads(s3, bucket: str, prefix: str, samples: list[dict],
