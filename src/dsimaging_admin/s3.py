@@ -5,7 +5,27 @@ from botocore.config import Config
 from urllib.parse import urlparse
 
 
-def create_client(endpoint: str, access_key: str, secret_key: str,
+def detect_backend(endpoint: str | None, override: str = "auto") -> tuple[str, str]:
+    """Return ``(backend, rationale)`` for an endpoint and optional override."""
+    if override and override != "auto":
+        return override, f"explicit override: {override}"
+    endpoint = (endpoint or "").strip()
+    lower = endpoint.lower()
+    if not lower or "amazonaws.com" in lower:
+        return "aws", "empty endpoint or amazonaws.com uses native AWS S3"
+    if (
+        "minio" in lower
+        or lower.startswith("http://127.0.0.1")
+        or lower.startswith("http://localhost")
+        or lower.startswith("https://127.0.0.1")
+        or lower.startswith("https://localhost")
+    ):
+        return "minio", "local/minio endpoint heuristic"
+    return "s3-compatible", "custom S3-compatible endpoint"
+
+
+def create_client(endpoint: str | None, access_key: str | None = None,
+                  secret_key: str | None = None,
                   region: str = "") -> boto3.client:
     """Create a boto3 S3 client.
 
@@ -17,13 +37,12 @@ def create_client(endpoint: str, access_key: str, secret_key: str,
     if endpoint:
         kwargs["endpoint_url"] = endpoint
 
-    return boto3.client(
-        "s3",
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
-        config=Config(signature_version="s3v4"),
-        **kwargs,
-    )
+    if access_key:
+        kwargs["aws_access_key_id"] = access_key
+    if secret_key:
+        kwargs["aws_secret_access_key"] = secret_key
+
+    return boto3.client("s3", config=Config(signature_version="s3v4"), **kwargs)
 
 
 def list_datasets(s3, bucket: str) -> list[dict]:

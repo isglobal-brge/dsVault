@@ -62,6 +62,26 @@ dsimaging-admin download study_ct_v1 ./debug/study_ct_v1
 dsimaging-admin delete study_ct_v1 --yes --purge-versions
 ```
 
+## Local operator UI
+
+The optional Streamlit dashboard wraps the same store and dataset operations in a
+guided local interface:
+
+```bash
+pip install "dsimaging-admin[ui]"
+dsimaging-admin ui launch
+```
+
+By default it binds to `127.0.0.1:8501`. This is an operator-only tool for
+administrators with storage access: it has full visibility of bucket paths,
+object sizes, manifests, controller responses and backend errors. It does not
+add an authentication layer, so keep the default localhost bind unless you are
+running it inside a trusted administrative environment. Access keys, secret keys,
+KMS keys and webhook tokens are entered as password fields and are only shown as
+set/not-set indicators after entry. Installing `streamlit-autorefresh`
+separately enables automatic controller polling; otherwise the UI keeps a manual
+refresh button.
+
 All reporting commands that are useful for automation support JSON output:
 
 ```bash

@@ -185,6 +185,33 @@ def store_group():
     """Create and operate local dsimaging-store Compose projects."""
 
 
+@main.group("ui")
+def ui_group():
+    """Launch the local operator dashboard."""
+
+
+@ui_group.command("launch")
+@click.option("--host", default="127.0.0.1", show_default=True,
+              help="Interface to bind the local dashboard server")
+@click.option("--port", default=8501, show_default=True,
+              help="Port for the local dashboard server")
+@click.option("--open-browser", is_flag=True,
+              help="Ask Streamlit to open a browser window")
+def ui_launch(host, port, open_browser):
+    """Open the Streamlit operator dashboard."""
+    if host not in ("127.0.0.1", "localhost"):
+        click.echo(
+            "WARNING: dsimaging-admin ui is an unauthenticated local operator tool; "
+            f"binding to {host} may expose storage administration controls.",
+            err=True,
+        )
+    try:
+        from .ui import launch_ui
+    except ImportError as e:
+        raise click.ClickException(str(e)) from e
+    launch_ui(host=host, port=port, open_browser=open_browser)
+
+
 @store_group.command("init")
 @click.argument("path", type=click.Path(file_okay=False))
 @click.option("--force", is_flag=True, help="Overwrite generated store files")

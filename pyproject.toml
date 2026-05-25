@@ -31,6 +31,11 @@ dependencies = [
     "pydicom>=3.0.0",
 ]
 
+[project.optional-dependencies]
+ui = [
+    "streamlit>=1.28",
+]
+
 [project.scripts]
 dsimaging-admin = "dsimaging_admin.cli:main"
 

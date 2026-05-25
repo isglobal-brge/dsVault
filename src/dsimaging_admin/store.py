@@ -121,6 +121,10 @@ def compose_ps(path: str) -> str:
     return _run(_compose_cmd(path) + ["ps"], cwd=path)
 
 
+def compose_ps_json(path: str) -> str:
+    return _run(_compose_cmd(path) + ["ps", "--format", "json"], cwd=path)
+
+
 def compose_logs(path: str, service: str | None = None, tail: int = 100) -> str:
     cmd = _compose_cmd(path) + ["logs", "--tail", str(tail)]
     if service:
