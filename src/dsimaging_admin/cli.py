@@ -283,9 +283,18 @@ def dataset_group():
     """Manage datasets inside an imaging store."""
 
 
-@main.group("ui")
-def ui_group():
+@main.group("ui", invoke_without_command=True)
+@click.option("--host", default="127.0.0.1", show_default=True,
+              help="Interface to bind the local dashboard server")
+@click.option("--port", default=8501, show_default=True,
+              help="Port for the local dashboard server")
+@click.option("--open-browser", is_flag=True,
+              help="Ask Streamlit to open a browser window")
+@click.pass_context
+def ui_group(ctx, host, port, open_browser):
     """Launch the local operator dashboard."""
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(ui_launch, host=host, port=port, open_browser=open_browser)
 
 
 @ui_group.command("launch")
