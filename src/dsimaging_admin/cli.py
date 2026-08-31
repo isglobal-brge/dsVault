@@ -219,7 +219,12 @@ def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
     """Admin CLI for managing dsimaging-store deployments and datasets."""
     cfg = _load_config(profile)
     backend = _resolve_backend(backend, cfg)
-    raw_endpoint = _resolve_optional(endpoint, "DSIMAGING_ENDPOINT", cfg, "endpoint")
+    # A stored profile endpoint applies only to store backends (auto/minio/
+    # s3-compatible); when AWS is requested, only an explicit CLI flag or
+    # DSIMAGING_ENDPOINT env value may set the endpoint.
+    endpoint_cfg = {} if backend == "aws" else cfg
+    raw_endpoint = _resolve_optional(endpoint, "DSIMAGING_ENDPOINT", endpoint_cfg,
+                                     "endpoint")
     endpoint = raw_endpoint or ("" if backend == "aws" else "http://127.0.0.1:9000")
     resolved_backend, backend_rationale = detect_backend(endpoint or None, backend)
     if resolved_backend == "aws":
@@ -320,7 +325,7 @@ def ui_launch(host, port, open_browser):
 
 
 @store_group.command("init")
-@click.argument("path", required=False, default=".", type=click.Path(file_okay=False))
+@click.argument("path", required=True, type=click.Path(file_okay=False))
 @click.option("--force", is_flag=True, help="Overwrite generated store files")
 @click.option("--controller-image", default=DEFAULT_CONTROLLER_IMAGE,
               show_default=True, help="Controller image for image-based stores")
@@ -333,7 +338,8 @@ def ui_launch(host, port, open_browser):
 @click.option("--access-key", default=None, help="S3 access key override")
 @click.option("--secret-key", default=None, help="S3 secret key override")
 @click.option("--bucket", default=None, help="Bucket name override")
-@click.option("--minio-port", default=9000, show_default=True)
+@click.option("--minio-port", default=None, type=int,
+              help="MinIO port [default: the global --endpoint port, else 9000]")
 @click.option("--console-port", default=9001, show_default=True)
 @click.option("--controller-port", default=8080, show_default=True)
 @click.option("--reconcile-interval", default=10, show_default=True)
@@ -343,6 +349,10 @@ def store_init(ctx, path, force, controller_image, store_source, backend, kms_ke
                controller_port,
                reconcile_interval):
     """Provision a store: MinIO Compose locally, or AWS S3/SQS on AWS.
+
+    PATH is the explicit destination directory for the generated Compose
+    project files (docker-compose.yml, .env, init-bucket.sh); files are
+    never written implicitly to the current directory.
 
     AWS mode requires IAM permissions for s3:CreateBucket,
     s3:PutBucketVersioning, s3:PutBucketEncryption,
@@ -388,6 +398,8 @@ def store_init(ctx, path, force, controller_image, store_source, backend, kms_ke
 
     access_key = access_key or ctx.obj.get("access_key") or "minioadmin"
     secret_key = secret_key or ctx.obj.get("secret_key") or "minioadmin123"
+    if minio_port is None:
+        minio_port = _local_endpoint_port(ctx.obj.get("endpoint")) or 9000
     try:
         cfg = init_store(
             path,
@@ -415,6 +427,14 @@ def store_init(ctx, path, force, controller_image, store_source, backend, kms_ke
 @click.option("--no-build", is_flag=True, help="Do not pass --build to docker compose")
 def store_up(path, no_build):
     """Start a store."""
+    root = Path(path).expanduser().resolve()
+    if not ((root / "docker-compose.yml").exists() and (root / ".env").exists()):
+        raise click.ClickException(
+            f"{path} is not a dsimaging-store project "
+            "(missing docker-compose.yml/.env); "
+            "run 'dsimaging-admin store init <dir>' first "
+            "or pass the store directory"
+        )
     _echo_command_output(compose_up(path, build=not no_build))
 
 
@@ -915,6 +935,20 @@ def modify(ctx, dataset_id, metadata, add_images, add_masks, dry_run, yes):
 def _echo_command_output(output: str) -> None:
     if output:
         click.echo(output)
+
+
+def _local_endpoint_port(endpoint: str | None) -> int | None:
+    """Return the explicit port of a local endpoint URL, if any."""
+    if not endpoint:
+        return None
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(endpoint)
+        if parts.hostname not in ("127.0.0.1", "localhost"):
+            return None
+        return parts.port
+    except ValueError:
+        return None
 
 
 def _validate_dataset_cli(dataset_id: str) -> None:

@@ -7,7 +7,9 @@ import unittest
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from click.testing import CliRunner
 
+from dsimaging_admin.cli import main
 from dsimaging_admin.manifest import build_hash_index
 from dsimaging_admin.store import init_store, load_store_config
 from dsimaging_admin.verify import verify_dataset
@@ -101,6 +103,47 @@ class AdminFeatureTests(unittest.TestCase):
 
         self.assertIn("build:", compose)
         self.assertIn("/controller", compose)
+
+    def test_cli_store_init_requires_explicit_path(self):
+        runner = CliRunner()
+        result = runner.invoke(main, ["store", "init"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("Missing argument", result.output)
+
+    def test_cli_store_init_derives_minio_port_from_endpoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = CliRunner()
+            result = runner.invoke(main, [
+                "--endpoint", "http://127.0.0.1:9100",
+                "--skip-controller",
+                "store", "init", tmpdir,
+            ])
+            self.assertEqual(result.exit_code, 0, result.output)
+            with open(os.path.join(tmpdir, ".env"), encoding="utf-8") as f:
+                env = f.read()
+        self.assertIn("MINIO_PORT=9100", env)
+
+    def test_cli_store_init_explicit_minio_port_wins(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = CliRunner()
+            result = runner.invoke(main, [
+                "--endpoint", "http://127.0.0.1:9100",
+                "--skip-controller",
+                "store", "init", tmpdir,
+                "--minio-port", "9200",
+            ])
+            self.assertEqual(result.exit_code, 0, result.output)
+            with open(os.path.join(tmpdir, ".env"), encoding="utf-8") as f:
+                env = f.read()
+        self.assertIn("MINIO_PORT=9200", env)
+
+    def test_cli_store_up_rejects_non_store_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = CliRunner()
+            result = runner.invoke(main, ["store", "up", tmpdir])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("is not a dsimaging-store project", result.output)
+        self.assertIn("docker-compose.yml/.env", result.output)
 
     def test_verify_dataset_accepts_matching_single_file(self):
         bucket = "imaging-data"

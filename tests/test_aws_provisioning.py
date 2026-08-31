@@ -188,7 +188,7 @@ class AwsProvisioningTests(unittest.TestCase):
             args = [
                 "--backend", "aws",
                 "--bucket", "imaging-data-cli",
-                "store", "init",
+                "store", "init", tmpdir,
             ]
             env = {
                 "AWS_ACCESS_KEY_ID": "testing",

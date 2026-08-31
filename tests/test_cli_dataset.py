@@ -81,6 +81,36 @@ class DatasetCliTests(unittest.TestCase):
             self.assertEqual(table["stage"].to_pylist(), ["IIIA"])
 
     @unittest.skipUnless(HAS_MOTO, "moto is not installed")
+    def test_backend_aws_ignores_profile_endpoint(self):
+        """--backend aws must not inherit the stored profile's MinIO endpoint."""
+        with mock_aws(), tempfile.TemporaryDirectory() as tmpdir:
+            bucket = "imaging-data"
+            boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=bucket)
+            source = self._make_source(tmpdir, "case001", b"nifti-one")
+            config_path = os.path.join(tmpdir, "dsimaging.yaml")
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "default_profile: default\n"
+                    "profiles:\n"
+                    "  default:\n"
+                    "    endpoint: http://127.0.0.1:9000\n"
+                )
+
+            runner = CliRunner()
+            with patch("dsimaging_admin.cli.CONFIG_PATH", config_path):
+                result = runner.invoke(main, [
+                    "--backend", "aws",
+                    "--bucket", bucket,
+                    "dataset", "publish",
+                    "--dataset-id", "lung_ct_v1",
+                    "--source", source,
+                    "--modality", "ct",
+                    "--no-atomic",
+                    "--skip-dicom-checks",
+                ])
+            self.assertEqual(result.exit_code, 0, result.output)
+
+    @unittest.skipUnless(HAS_MOTO, "moto is not installed")
     def test_dataset_modify_add_images_and_dry_run(self):
         with mock_aws(), tempfile.TemporaryDirectory() as tmpdir:
             bucket = "imaging-data"
