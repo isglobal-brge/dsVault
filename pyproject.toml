@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dsimaging-admin"
-version = "0.3.5"
+version = "0.3.6"
 description = "Admin CLI for managing medical imaging datasets in S3/MinIO for DataSHIELD"
 readme = "README.md"
 license = "MIT"
