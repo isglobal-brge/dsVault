@@ -257,6 +257,38 @@ class AdminFeatureTests(unittest.TestCase):
                 env = f.read()
         self.assertIn("MINIO_PORT=9200", env)
 
+    def test_cli_store_init_does_not_reuse_connection_credentials(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = CliRunner()
+            result = runner.invoke(
+                main,
+                ["--skip-controller", "store", "init", tmpdir],
+                env={
+                    "DSIMAGING_ACCESS_KEY": "minioadmin",
+                    "DSIMAGING_SECRET_KEY": "minioadmin123",
+                },
+            )
+            self.assertEqual(result.exit_code, 0, result.output)
+            generated = load_store_config(tmpdir)
+
+        self.assertTrue(generated.access_key.startswith("dsimg"))
+        self.assertNotEqual(generated.access_key, "minioadmin")
+        self.assertNotEqual(generated.secret_key, "minioadmin123")
+
+    def test_cli_store_init_accepts_explicit_new_store_credentials(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = CliRunner()
+            result = runner.invoke(main, [
+                "--skip-controller", "store", "init", tmpdir,
+                "--access-key", "explicit-user",
+                "--secret-key", "explicit-secret-value",
+            ])
+            self.assertEqual(result.exit_code, 0, result.output)
+            generated = load_store_config(tmpdir)
+
+        self.assertEqual(generated.access_key, "explicit-user")
+        self.assertEqual(generated.secret_key, "explicit-secret-value")
+
     def test_cli_store_up_rejects_non_store_directory(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             runner = CliRunner()

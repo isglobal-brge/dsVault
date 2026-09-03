@@ -32,6 +32,9 @@ New local projects generate unique MinIO credentials and an operator token in
 `./study-store/.env` (mode `0600`). MinIO's API, console and controller are
 bound to `127.0.0.1` by default. Configure a CLI profile from those generated
 values before running dataset commands; no shared MinIO credential is built in.
+Credentials from an existing connection profile are not reused for a new
+store. Pass `store init --access-key ... --secret-key ...` only when an
+explicit provisioning override is required.
 
 For local controller development, build from a checked-out `dsimaging-store`
 repo instead of using an image:

@@ -240,16 +240,6 @@ def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
          controller_url, controller_token, skip_controller, backend):
     """Admin CLI for managing dsimaging-store deployments and datasets."""
     cfg = _load_config(profile)
-    access_key_configured = (
-        access_key not in (None, "") or
-        bool(os.environ.get("DSIMAGING_ACCESS_KEY")) or
-        cfg.get("access_key") not in (None, "")
-    )
-    secret_key_configured = (
-        secret_key not in (None, "") or
-        bool(os.environ.get("DSIMAGING_SECRET_KEY")) or
-        cfg.get("secret_key") not in (None, "")
-    )
     backend = _resolve_backend(backend, cfg)
     # A stored profile endpoint applies only to store backends (auto/minio/
     # s3-compatible); when AWS is requested, only an explicit CLI flag or
@@ -281,8 +271,6 @@ def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
     ctx.obj["endpoint"] = endpoint
     ctx.obj["access_key"] = access_key
     ctx.obj["secret_key"] = secret_key
-    ctx.obj["access_key_configured"] = access_key_configured
-    ctx.obj["secret_key_configured"] = secret_key_configured
     ctx.obj["region"] = region
     ctx.obj["backend"] = resolved_backend
     ctx.obj["backend_rationale"] = backend_rationale
@@ -434,10 +422,11 @@ def store_init(ctx, path, force, controller_image, store_source, backend, kms_ke
             click.echo(f"  SQS queue URL saved to {CONFIG_PATH}")
         return
 
-    access_key = access_key or (
-        ctx.obj.get("access_key") if ctx.obj.get("access_key_configured") else None)
-    secret_key = secret_key or (
-        ctx.obj.get("secret_key") if ctx.obj.get("secret_key_configured") else None)
+    # Connection profiles describe existing stores. Reusing their credentials
+    # for a newly provisioned local store would silently defeat the unique
+    # credential default; only options on `store init` may override generation.
+    access_key = access_key or None
+    secret_key = secret_key or None
     if minio_port is None:
         minio_port = _local_endpoint_port(ctx.obj.get("endpoint")) or 9000
     try:

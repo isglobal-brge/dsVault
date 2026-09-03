@@ -10,6 +10,9 @@
 - Store configuration writes are atomic and private, the UI applies the same
   DICOM checks as the CLI, and generated stores use a dedicated authenticated
   webhook credential.
+- Local store creation no longer inherits credentials from a connection
+  profile; fresh unique credentials are generated unless explicit overrides
+  are supplied to `store init`.
 
 ## 0.3.8
 
