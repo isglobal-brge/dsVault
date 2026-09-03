@@ -223,7 +223,8 @@ def scan_s3_images(s3, bucket: str, prefix: str, objects: list[dict]) -> list[di
 
     samples = []
     for rel, obj in sorted(single_files, key=lambda item: item[0]):
-        content_hash = _sha256_s3_object(s3, bucket, obj["key"])
+        content_hash = _sha256_s3_object(
+            s3, bucket, obj["key"], obj.get("version_id"))
         filename = rel.rsplit("/", 1)[-1]
         samples.append({
             "sample_id": sample_id_from_filename(filename),
@@ -235,6 +236,11 @@ def scan_s3_images(s3, bucket: str, prefix: str, objects: list[dict]) -> list[di
             "size": int(obj.get("size", 0)),
             "last_modified": obj.get("last_modified"),
             "version_id": obj.get("version_id"),
+            "content_hash_version_id": (
+                obj.get("version_id")
+                if obj.get("version_id") not in (None, "", "null")
+                else None
+            ),
             "etag": obj.get("etag"),
         })
 
@@ -245,7 +251,8 @@ def scan_s3_images(s3, bucket: str, prefix: str, objects: list[dict]) -> list[di
         last_modified = None
         etags = []
         for rel, obj in sorted(dicom_groups[sample_id], key=lambda item: item[0]):
-            content_hash = _sha256_s3_object(s3, bucket, obj["key"])
+            content_hash = _sha256_s3_object(
+                s3, bucket, obj["key"], obj.get("version_id"))
             h.update(content_hash.encode())
             total_size += int(obj.get("size", 0))
             last_modified = obj.get("last_modified") or last_modified
@@ -287,7 +294,8 @@ def scan_s3_masks(s3, bucket: str, prefix: str, objects: list[dict],
         if not is_image_file(filename):
             continue
         _validate_relative_asset_path(rel)
-        content_hash = _sha256_s3_object(s3, bucket, key)
+        content_hash = _sha256_s3_object(
+            s3, bucket, key, obj.get("version_id"))
         masks.append({
             "sample_id": _sample_id_from_mask_filename(filename, sample_ids),
             "source_kind": "mask_file",
@@ -298,6 +306,11 @@ def scan_s3_masks(s3, bucket: str, prefix: str, objects: list[dict],
             "size": int(obj.get("size", 0)),
             "last_modified": obj.get("last_modified"),
             "version_id": obj.get("version_id"),
+            "content_hash_version_id": (
+                obj.get("version_id")
+                if obj.get("version_id") not in (None, "", "null")
+                else None
+            ),
             "etag": obj.get("etag"),
         })
 
@@ -528,6 +541,7 @@ def build_hash_index(samples: list[dict], bucket: str, prefix: str,
             "size": pa.array([], type=pa.int64()),
             "last_modified": pa.array([], type=pa.string()),
             "version_id": pa.array([], type=pa.string()),
+            "content_hash_version_id": pa.array([], type=pa.string()),
             "etag": pa.array([], type=pa.string()),
             "source_kind": pa.array([], type=pa.string()),
         })
@@ -543,6 +557,10 @@ def build_hash_index(samples: list[dict], bucket: str, prefix: str,
         "size": pa.array([s["size"] for s in samples], type=pa.int64()),
         "last_modified": [s.get("last_modified") or now for s in samples],
         "version_id": pa.array([s.get("version_id") for s in samples], type=pa.string()),
+        "content_hash_version_id": pa.array(
+            [s.get("content_hash_version_id") for s in samples],
+            type=pa.string(),
+        ),
         "etag": pa.array([s.get("etag") for s in samples], type=pa.string()),
         "source_kind": [s["source_kind"] for s in samples],
     })
@@ -884,9 +902,13 @@ def _sample_id_from_mask_filename(filename: str,
     return stripped or stem
 
 
-def _sha256_s3_object(s3, bucket: str, key: str) -> str:
+def _sha256_s3_object(s3, bucket: str, key: str,
+                      version_id: str | None = None) -> str:
     h = hashlib.sha256()
-    response = s3.get_object(Bucket=bucket, Key=key)
+    request = {"Bucket": bucket, "Key": key}
+    if version_id not in (None, "", "null"):
+        request["VersionId"] = version_id
+    response = s3.get_object(**request)
     body = response["Body"]
     try:
         for chunk in iter(lambda: body.read(65536), b""):

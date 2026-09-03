@@ -1,5 +1,14 @@
 # NEWS
 
+## 0.3.10
+
+- S3 publication and reconciliation now hash the exact immutable object
+  versions recorded in collection indexes and derive each listing from one
+  coherent HEAD snapshot.
+- Quick verification trusts a stored content hash only when it is explicitly
+  attested to the same non-null S3 version; legacy indexes are fully rehashed.
+- JPEG files using either `.jpg` or `.jpeg` are recognized consistently.
+
 ## 0.3.9
 
 - Collection publication carries an explicit public label vocabulary through

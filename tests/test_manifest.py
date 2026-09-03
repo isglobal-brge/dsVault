@@ -1,4 +1,5 @@
 import io
+import hashlib
 import os
 import tempfile
 import unittest
@@ -30,6 +31,19 @@ class FakeS3:
 
     def get_object(self, Bucket, Key):
         return {"Body": FakeBody(self.objects[Key])}
+
+
+class VersionedFakeS3:
+    def __init__(self, current, versions):
+        self.current = current
+        self.versions = versions
+        self.requests = []
+
+    def get_object(self, Bucket, Key, VersionId=None):
+        self.requests.append((Key, VersionId))
+        payload = (self.current[Key] if VersionId is None else
+                   self.versions[(Key, VersionId)])
+        return {"Body": FakeBody(payload)}
 
 
 class ManifestTests(unittest.TestCase):
@@ -79,6 +93,51 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(samples[0]["uri_path"], "a.nii.gz")
         self.assertEqual(samples[1]["source_kind"], "dicom_series")
         self.assertEqual(len(samples[1]["files"]), 2)
+
+    def test_scan_s3_assets_hash_the_recorded_object_versions(self):
+        bucket = "imaging-data"
+        prefix = "datasets/study_ct_v1"
+        image_key = f"{prefix}/source/images/a.nii.gz"
+        slice_keys = [
+            f"{prefix}/source/images/series1/001.dcm",
+            f"{prefix}/source/images/series1/002.dcm",
+        ]
+        mask_key = f"{prefix}/source/masks/a_mask.nii.gz"
+        keys = [image_key, *slice_keys, mask_key]
+        versions = {(key, "version-1"): f"old-{key}".encode()
+                    for key in keys}
+        current = {key: f"new-{key}".encode() for key in keys}
+        s3 = VersionedFakeS3(current, versions)
+        image_objects = [
+            {"key": key, "size": len(versions[(key, "version-1")]),
+             "last_modified": "2026-05-08T00:00:00Z",
+             "version_id": "version-1"}
+            for key in [image_key, *slice_keys]
+        ]
+        mask_objects = [{
+            "key": mask_key,
+            "size": len(versions[(mask_key, "version-1")]),
+            "last_modified": "2026-05-08T00:00:00Z",
+            "version_id": "version-1",
+        }]
+
+        samples = scan_s3_images(s3, bucket, prefix, image_objects)
+        masks = scan_s3_masks(
+            s3, bucket, prefix, mask_objects, sample_ids=["a", "series1"])
+
+        expected_image = hashlib.sha256(
+            versions[(image_key, "version-1")]).hexdigest()
+        expected_series = hashlib.sha256()
+        for key in slice_keys:
+            expected_series.update(hashlib.sha256(
+                versions[(key, "version-1")]).hexdigest().encode())
+        self.assertEqual(samples[0]["content_hash"], expected_image)
+        self.assertEqual(samples[1]["content_hash"], expected_series.hexdigest())
+        self.assertEqual(
+            masks[0]["content_hash"],
+            hashlib.sha256(versions[(mask_key, "version-1")]).hexdigest(),
+        )
+        self.assertEqual(s3.requests, [(key, "version-1") for key in keys])
 
     def test_scan_masks_maps_common_suffixes_to_image_samples(self):
         with tempfile.TemporaryDirectory() as tmpdir:

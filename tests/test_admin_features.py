@@ -18,6 +18,7 @@ from dsimaging_admin.manifest import (
     build_samples_metadata,
     generate_manifest,
 )
+from dsimaging_admin.s3 import list_objects
 from dsimaging_admin.store import (
     DEFAULT_CONTROLLER_IMAGE,
     DEFAULT_MC_IMAGE,
@@ -118,6 +119,47 @@ def publication_artifacts(bucket, prefix, samples, now):
 
 
 class AdminFeatureTests(unittest.TestCase):
+    def test_versioned_listing_uses_one_coherent_head_snapshot(self):
+        listed_at = dt.datetime(2026, 5, 12, tzinfo=dt.timezone.utc)
+        headed_at = dt.datetime(2026, 5, 13, tzinfo=dt.timezone.utc)
+
+        class StalePaginator:
+            def paginate(self, Bucket, Prefix):
+                return [{"Contents": [{
+                    "Key": f"{Prefix}case001.nii.gz",
+                    "Size": 3,
+                    "LastModified": listed_at,
+                    "ETag": '"listed-etag"',
+                }]}]
+
+        class HeadedS3:
+            def get_paginator(self, name):
+                if name != "list_objects_v2":
+                    raise ValueError(name)
+                return StalePaginator()
+
+            def head_object(self, Bucket, Key):
+                return {
+                    "ContentLength": 7,
+                    "LastModified": headed_at,
+                    "ETag": '"headed-etag"',
+                    "VersionId": "version-2",
+                }
+
+        objects = list_objects(
+            HeadedS3(), "imaging-data", "datasets/study/source/images/",
+            include_version_ids=True,
+        )
+
+        self.assertEqual(objects, [{
+            "key": "datasets/study/source/images/case001.nii.gz",
+            "size": 7,
+            "last_modified": headed_at.isoformat(),
+            "etag": "headed-etag",
+            "version_id": "version-2",
+            "content_type": None,
+        }])
+
     def test_verify_dataset_rejects_noncanonical_dataset_id(self):
         with self.assertRaisesRegex(ValueError, "dataset_id must match"):
             verify_dataset(FakeS3({}), "imaging-data", "../other")
@@ -403,7 +445,7 @@ class AdminFeatureTests(unittest.TestCase):
         self.assertEqual(result.mismatched, 1)
         self.assertEqual(result.quick_ok, 0)
 
-    def test_verify_quick_accepts_matching_immutable_version(self):
+    def test_verify_quick_rechecks_legacy_unattested_version_hash(self):
         bucket = "imaging-data"
         prefix = "datasets/study_ct_v1"
         payload = b"actual"
@@ -416,6 +458,44 @@ class AdminFeatureTests(unittest.TestCase):
             "content_hash": hashlib.sha256(b"recorded-at-upload").hexdigest(),
             "size": len(payload),
             "version_id": "immutable-version-1",
+            "etag": "same-etag",
+        }
+        now = dt.datetime(2026, 5, 13, tzinfo=dt.timezone.utc)
+        objects = {
+            f"{prefix}/source/images/case001.nii.gz": {
+                "body": payload,
+                "etag": "same-etag",
+                "version_id": "immutable-version-1",
+                "last_modified": now,
+            },
+            f"{prefix}/indexes/content_hash_index.parquet": {
+                "body": parquet_bytes(build_hash_index([sample], bucket, prefix)),
+                "last_modified": now,
+            },
+        }
+        objects.update(publication_artifacts(bucket, prefix, [sample], now))
+
+        result = verify_dataset(
+            FakeS3(objects), bucket, "study_ct_v1", quick=True)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.mismatched, 1)
+        self.assertEqual(result.quick_ok, 0)
+
+    def test_verify_quick_accepts_version_bound_hash(self):
+        bucket = "imaging-data"
+        prefix = "datasets/study_ct_v1"
+        payload = b"actual"
+        sample = {
+            "sample_id": "case001",
+            "source_kind": "single_file",
+            "primary_filename": "case001.nii.gz",
+            "uri_path": "case001.nii.gz",
+            "files": [{"path": "case001.nii.gz", "role": "primary"}],
+            "content_hash": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+            "version_id": "immutable-version-1",
+            "content_hash_version_id": "immutable-version-1",
             "etag": "same-etag",
         }
         now = dt.datetime(2026, 5, 13, tzinfo=dt.timezone.utc)

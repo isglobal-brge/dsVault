@@ -6,7 +6,7 @@ import os
 HASH_CHUNK = 65536
 IMAGE_EXTENSIONS = frozenset({
     ".nii.gz", ".nii", ".nrrd", ".mha", ".mhd", ".dcm",
-    ".svs", ".tif", ".tiff", ".png", ".jpg",
+    ".svs", ".tif", ".tiff", ".png", ".jpg", ".jpeg",
 })
 
 

@@ -379,6 +379,7 @@ def _verify_row(s3, configured_bucket: str, row: dict,
     expected_hash = row.get("content_hash") or ""
     expected_size = int(row.get("size") or 0)
     expected_version = row.get("version_id")
+    hash_version = row.get("content_hash_version_id")
 
     try:
         uri_bucket, key = parse_s3_uri(uri)
@@ -406,6 +407,7 @@ def _verify_row(s3, configured_bucket: str, row: dict,
     # common S3 uploads they are only MD5-derived and must never replace the
     # recorded SHA-256 content check.
     if (quick and expected_version not in (None, "", "null") and
+            hash_version == expected_version and
             meta.get("version_id") == expected_version and
             meta.get("size") == expected_size):
         return None, {key}, True

@@ -137,18 +137,20 @@ def list_objects(s3, bucket: str, prefix: str, *,
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
-            version_id = None
             if include_version_ids:
                 metadata = head_object(s3, bucket, obj["Key"])
-                if metadata is not None:
-                    version_id = metadata.get("version_id")
-            objects.append({
-                "key": obj["Key"],
-                "size": obj["Size"],
-                "last_modified": obj["LastModified"].isoformat(),
-                "etag": obj.get("ETag", "").strip('"') or None,
-                "version_id": version_id,
-            })
+                if metadata is None:
+                    raise RuntimeError(
+                        "object changed while its immutable metadata was read")
+                objects.append(metadata)
+            else:
+                objects.append({
+                    "key": obj["Key"],
+                    "size": obj["Size"],
+                    "last_modified": obj["LastModified"].isoformat(),
+                    "etag": obj.get("ETag", "").strip('"') or None,
+                    "version_id": None,
+                })
     return objects
 
 
