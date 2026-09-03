@@ -16,8 +16,8 @@ from .s3 import create_client
 
 
 DEFAULT_CONTROLLER_IMAGE = (
-    "davidsarrat/dsimaging-store:0.3.9@"
-    "sha256:0f94d9da2e6d5c2330e08a7b0aed458b77a872a5df3c6e0e09b0b1dcb5df9b62"
+    "davidsarrat/dsimaging-store:0.3.10@"
+    "sha256:0aae2ed2870c4f6e193c4878cd8162eb434990c7a7f79d5a8cc491ceb4f76f7a"
 )
 DEFAULT_MINIO_IMAGE = (
     "minio/minio:RELEASE.2025-09-07T16-13-09Z@"

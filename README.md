@@ -26,7 +26,7 @@ The generated project pins the published multi-architecture controller, MinIO
 and MinIO client images by both release tag and manifest-list digest. Use
 `--controller-image` only to select a deliberate controller upgrade.
 The controller image is also directly available as
-`davidsarrat/dsimaging-store:0.3.9` for `linux/amd64` and `linux/arm64`.
+`davidsarrat/dsimaging-store:0.3.10` for `linux/amd64` and `linux/arm64`.
 
 New local projects generate unique MinIO credentials and an operator token in
 `./study-store/.env` (mode `0600`). MinIO's API, console and controller are
