@@ -1,5 +1,22 @@
 # NEWS
 
+## 0.3.7
+
+- Dataset manifests now require and preserve the patient-level privacy-unit
+  contract used by dsImaging admission.
+- Sample IDs are canonical and unique, patient IDs are stored using the shared
+  `trim-utf8-v2` representation, and mask-to-sample mappings reject duplicates
+  and orphans.
+- Atomic publication uses an S3 conditional lock, stages replacements, writes
+  the manifest last, and restores the previous dataset on failure.
+- Publication locks carry a unique owner and are released conditionally; copy
+  locks its source snapshot, and metadata must match the image roster exactly.
+- Verification now checks the complete image, metadata and mask contract and
+  fails closed for corrupt or incomplete publication artifacts.
+- Generated stores keep a random controller operator token in a mode-`0600`
+  `.env`; controller inventory and manual reconciliation clients send it as a
+  bearer token while health remains a coarse liveness check.
+
 ## 0.3.6
 
 - Test isolation: added a hermetic `tests/conftest.py` that redirects `HOME`

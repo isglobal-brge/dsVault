@@ -17,12 +17,16 @@ def normalise_controller_url(url: str | None) -> str | None:
     return url.rstrip("/")
 
 
-def get_json(controller_url: str, path: str, timeout: float = 5.0) -> dict:
+def get_json(controller_url: str, path: str, timeout: float = 5.0, *,
+             token: str | None = None) -> dict:
     """GET a JSON controller endpoint."""
     base = normalise_controller_url(controller_url)
     if not base:
         raise ControllerError("controller URL is empty")
-    response = requests.get(f"{base}/{path.lstrip('/')}", timeout=timeout)
+    response = requests.get(
+        f"{base}/{path.lstrip('/')}", timeout=timeout,
+        headers=_operator_headers(token),
+    )
     if response.status_code >= 400:
         raise ControllerError(
             f"controller GET {path} failed with {response.status_code}: "
@@ -37,12 +41,16 @@ def get_json(controller_url: str, path: str, timeout: float = 5.0) -> dict:
     return payload
 
 
-def post_json(controller_url: str, path: str, timeout: float = 30.0) -> dict:
+def post_json(controller_url: str, path: str, timeout: float = 30.0, *,
+              token: str | None = None) -> dict:
     """POST to a JSON controller endpoint."""
     base = normalise_controller_url(controller_url)
     if not base:
         raise ControllerError("controller URL is empty")
-    response = requests.post(f"{base}/{path.lstrip('/')}", timeout=timeout)
+    response = requests.post(
+        f"{base}/{path.lstrip('/')}", timeout=timeout,
+        headers=_operator_headers(token),
+    )
     if response.status_code >= 400:
         raise ControllerError(
             f"controller POST {path} failed with {response.status_code}: "
@@ -61,14 +69,25 @@ def health(controller_url: str, timeout: float = 5.0) -> dict:
     return get_json(controller_url, "/health", timeout=timeout)
 
 
-def datasets(controller_url: str, timeout: float = 5.0) -> list[dict]:
-    payload = get_json(controller_url, "/datasets", timeout=timeout)
+def datasets(controller_url: str, timeout: float = 5.0, *,
+             token: str | None = None) -> list[dict]:
+    payload = get_json(
+        controller_url, "/datasets", timeout=timeout, token=token)
     values = payload.get("datasets", [])
     if not isinstance(values, list):
         raise ControllerError("controller /datasets payload has no datasets list")
     return values
 
 
-def reconcile(controller_url: str, dataset_id: str, timeout: float = 30.0) -> dict:
+def reconcile(controller_url: str, dataset_id: str, timeout: float = 30.0, *,
+              token: str | None = None) -> dict:
     safe_id = quote(dataset_id, safe="")
-    return post_json(controller_url, f"/reconcile/{safe_id}", timeout=timeout)
+    return post_json(
+        controller_url, f"/reconcile/{safe_id}", timeout=timeout,
+        token=token,
+    )
+
+
+def _operator_headers(token: str | None) -> dict[str, str]:
+    value = token.strip() if isinstance(token, str) else ""
+    return {"Authorization": f"Bearer {value}"} if value else {}

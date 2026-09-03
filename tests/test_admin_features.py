@@ -2,15 +2,22 @@ import datetime as dt
 import hashlib
 import io
 import os
+import stat
 import tempfile
 import unittest
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import yaml
 from click.testing import CliRunner
 
 from dsimaging_admin.cli import main
-from dsimaging_admin.manifest import build_hash_index
+from dsimaging_admin.manifest import (
+    build_hash_index,
+    build_sample_manifests,
+    build_samples_metadata,
+    generate_manifest,
+)
 from dsimaging_admin.store import init_store, load_store_config
 from dsimaging_admin.verify import verify_dataset
 
@@ -74,6 +81,34 @@ def parquet_bytes(table):
     return sink.getvalue().to_pybytes()
 
 
+def publication_artifacts(bucket, prefix, samples, now):
+    metadata_input = pa.table({
+        "sample_id": [sample["sample_id"] for sample in samples],
+        "patient_id": [
+            f"patient-{index}" for index, _ in enumerate(samples, start=1)
+        ],
+    })
+    metadata = build_samples_metadata(
+        samples, metadata_input, privacy_unit_col="patient_id")
+    manifest = generate_manifest(
+        prefix.rsplit("/", 1)[-1], bucket, prefix,
+        privacy_unit_col="patient_id",
+    )
+    return {
+        f"{prefix}/manifest.yaml": {
+            "body": yaml.safe_dump(manifest, sort_keys=False).encode("utf-8"),
+            "last_modified": now,
+        },
+        f"{prefix}/metadata/samples.parquet": {
+            "body": parquet_bytes(metadata), "last_modified": now,
+        },
+        f"{prefix}/metadata/sample_manifests.parquet": {
+            "body": parquet_bytes(build_sample_manifests(samples)),
+            "last_modified": now,
+        },
+    }
+
+
 class AdminFeatureTests(unittest.TestCase):
     def test_store_init_generates_compose_project(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -87,10 +122,19 @@ class AdminFeatureTests(unittest.TestCase):
                 compose = f.read()
             with open(os.path.join(tmpdir, ".env"), encoding="utf-8") as f:
                 env = f.read()
+            env_mode = stat.S_IMODE(
+                os.stat(os.path.join(tmpdir, ".env")).st_mode)
 
         self.assertEqual(cfg.bucket, "custom-bucket")
         self.assertEqual(loaded.bucket, "custom-bucket")
+        self.assertTrue(cfg.controller_token)
+        self.assertEqual(cfg.controller_token, loaded.controller_token)
+        self.assertNotIn("controller_token", cfg.to_dict())
+        self.assertEqual(env_mode, 0o600)
         self.assertIn("example/dsimaging-store-controller:test", env)
+        self.assertIn("DSIMAGING_CONTROLLER_TOKEN=", env)
+        self.assertIn("DSIMAGING_CONTROLLER_TOKEN", compose)
+        self.assertIn('127.0.0.1:${CONTROLLER_PORT:-8080}:8080', compose)
         self.assertIn("controller", compose)
         self.assertIn("minio", compose)
 
@@ -162,7 +206,7 @@ class AdminFeatureTests(unittest.TestCase):
         }
         index = build_hash_index([sample], bucket, prefix)
         now = dt.datetime(2026, 5, 13, tzinfo=dt.timezone.utc)
-        s3 = FakeS3({
+        objects = {
             f"{prefix}/source/images/case001.nii.gz": {
                 "body": payload,
                 "etag": "same-etag",
@@ -172,7 +216,9 @@ class AdminFeatureTests(unittest.TestCase):
                 "body": parquet_bytes(index),
                 "last_modified": now,
             },
-        })
+        }
+        objects.update(publication_artifacts(bucket, prefix, [sample], now))
+        s3 = FakeS3(objects)
 
         result = verify_dataset(s3, bucket, "study_ct_v1")
 
@@ -194,7 +240,7 @@ class AdminFeatureTests(unittest.TestCase):
         }
         index = build_hash_index([sample], bucket, prefix)
         now = dt.datetime(2026, 5, 13, tzinfo=dt.timezone.utc)
-        s3 = FakeS3({
+        objects = {
             f"{prefix}/source/images/case001.nii.gz": {
                 "body": b"actual",
                 "last_modified": now,
@@ -203,7 +249,9 @@ class AdminFeatureTests(unittest.TestCase):
                 "body": parquet_bytes(index),
                 "last_modified": now,
             },
-        })
+        }
+        objects.update(publication_artifacts(bucket, prefix, [sample], now))
+        s3 = FakeS3(objects)
 
         result = verify_dataset(s3, bucket, "study_ct_v1")
 
@@ -225,7 +273,7 @@ class AdminFeatureTests(unittest.TestCase):
         }
         index = build_hash_index([sample], bucket, prefix)
         now = dt.datetime(2026, 5, 13, tzinfo=dt.timezone.utc)
-        s3 = FakeS3({
+        objects = {
             f"{prefix}/source/images/case001.nii.gz": {
                 "body": b"actual",
                 "etag": "same-etag",
@@ -235,12 +283,81 @@ class AdminFeatureTests(unittest.TestCase):
                 "body": parquet_bytes(index),
                 "last_modified": now,
             },
-        })
+        }
+        objects.update(publication_artifacts(bucket, prefix, [sample], now))
+        s3 = FakeS3(objects)
 
         result = verify_dataset(s3, bucket, "study_ct_v1", quick=True)
 
         self.assertTrue(result.ok)
         self.assertEqual(result.quick_ok, 1)
+
+    def test_verify_rejects_corrupt_publication_metadata(self):
+        bucket = "imaging-data"
+        prefix = "datasets/study_ct_v1"
+        payload = b"image"
+        sample = {
+            "sample_id": "case001", "source_kind": "single_file",
+            "primary_filename": "case001.nii.gz",
+            "uri_path": "case001.nii.gz",
+            "files": [{"path": "case001.nii.gz", "role": "primary"}],
+            "content_hash": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+        }
+        now = dt.datetime(2026, 5, 13, tzinfo=dt.timezone.utc)
+        objects = publication_artifacts(bucket, prefix, [sample], now)
+        objects.update({
+            f"{prefix}/source/images/case001.nii.gz": {
+                "body": payload, "last_modified": now,
+            },
+            f"{prefix}/indexes/content_hash_index.parquet": {
+                "body": parquet_bytes(build_hash_index(
+                    [sample], bucket, prefix)),
+                "last_modified": now,
+            },
+        })
+        objects[f"{prefix}/metadata/samples.parquet"]["body"] = b"corrupt"
+
+        result = verify_dataset(FakeS3(objects), bucket, "study_ct_v1")
+
+        self.assertFalse(result.ok)
+        self.assertTrue(any(
+            "publication contract" in issue.detail for issue in result.issues))
+
+    def test_verify_fraction_does_not_report_unselected_rows_as_extra(self):
+        bucket = "imaging-data"
+        prefix = "datasets/study_ct_v1"
+        now = dt.datetime(2026, 5, 13, tzinfo=dt.timezone.utc)
+        samples = []
+        objects = {}
+        for sample_id in ("case001", "case002"):
+            payload = sample_id.encode("utf-8")
+            samples.append({
+                "sample_id": sample_id, "source_kind": "single_file",
+                "primary_filename": f"{sample_id}.nii.gz",
+                "uri_path": f"{sample_id}.nii.gz",
+                "files": [{
+                    "path": f"{sample_id}.nii.gz", "role": "primary",
+                }],
+                "content_hash": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+            })
+            objects[f"{prefix}/source/images/{sample_id}.nii.gz"] = {
+                "body": payload, "last_modified": now,
+            }
+        objects[f"{prefix}/indexes/content_hash_index.parquet"] = {
+            "body": parquet_bytes(build_hash_index(samples, bucket, prefix)),
+            "last_modified": now,
+        }
+        objects.update(publication_artifacts(bucket, prefix, samples, now))
+
+        result = verify_dataset(
+            FakeS3(objects), bucket, "study_ct_v1", sample_fraction=0.5)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.checked, 1)
+        self.assertEqual(result.skipped, 1)
+        self.assertEqual(result.extra, 0)
 
 
 if __name__ == "__main__":

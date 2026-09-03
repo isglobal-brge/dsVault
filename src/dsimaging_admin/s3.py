@@ -174,12 +174,15 @@ def get_object_bytes(s3, bucket: str, key: str) -> bytes:
 
 
 def put_object_bytes(s3, bucket: str, key: str, data: bytes,
-                     content_type: str | None = None) -> None:
+                     content_type: str | None = None, *,
+                     if_absent: bool = False) -> dict:
     """Write bytes to S3."""
     kwargs = {"Bucket": bucket, "Key": key, "Body": data}
     if content_type:
         kwargs["ContentType"] = content_type
-    s3.put_object(**kwargs)
+    if if_absent:
+        kwargs["IfNoneMatch"] = "*"
+    return s3.put_object(**kwargs)
 
 
 def copy_object(s3, bucket: str, source_key: str, dest_key: str) -> None:

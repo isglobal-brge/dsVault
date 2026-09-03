@@ -33,6 +33,7 @@ from .manifest import (
     build_sample_manifests,
     build_samples_metadata,
     generate_manifest,
+    metadata_contract_from_manifest,
     read_metadata_table,
     scan_images,
     scan_masks,
@@ -207,6 +208,8 @@ class _DeprecatedDatasetAlias(click.Command):
 @click.option("--region", default=None, help="S3 region (empty for MinIO)")
 @click.option("--controller-url", default=None,
               help="dsimaging-store controller URL")
+@click.option("--controller-token", default=None,
+              help="Operator bearer token (prefer DSIMAGING_CONTROLLER_TOKEN)")
 @click.option("--skip-controller", is_flag=True,
               help="Do not call the dsimaging-store controller")
 @click.option("--backend",
@@ -215,7 +218,7 @@ class _DeprecatedDatasetAlias(click.Command):
               help="Storage backend override")
 @click.pass_context
 def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
-         controller_url, skip_controller, backend):
+         controller_url, controller_token, skip_controller, backend):
     """Admin CLI for managing dsimaging-store deployments and datasets."""
     cfg = _load_config(profile)
     backend = _resolve_backend(backend, cfg)
@@ -239,6 +242,9 @@ def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
     region = _resolve(region, "DSIMAGING_REGION", cfg, "region", "")
     controller_url = _resolve(controller_url, "DSIMAGING_CONTROLLER_URL", cfg,
                               "controller_url", "")
+    controller_token = _resolve_optional(
+        controller_token, "DSIMAGING_CONTROLLER_TOKEN", cfg,
+        "controller_token")
 
     ctx.ensure_object(dict)
     ctx.obj["s3"] = create_client(endpoint, access_key, secret_key, region)
@@ -251,6 +257,7 @@ def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
     ctx.obj["backend_rationale"] = backend_rationale
     ctx.obj["profile"] = profile
     ctx.obj["controller_url"] = controller_url
+    ctx.obj["controller_token"] = controller_token
     ctx.obj["skip_controller"] = skip_controller
 
 
@@ -504,8 +511,14 @@ def store_doctor_cmd(path, output):
 @click.option("--source", required=True, type=click.Path(exists=True),
               help="Local directory containing images")
 @click.option("--metadata", default=None, type=click.Path(exists=True, dir_okay=False),
-              help="Optional CSV/Parquet metadata with a sample_id column")
+              help="CSV/Parquet metadata required by the patient privacy contract")
+@click.option("--privacy-unit-column", required=True,
+              help="Metadata column containing the patient privacy unit")
+@click.option("--label-column", default=None,
+              help="Optional complete metadata label/outcome column")
 @click.option("--modality", default="unknown", help="Imaging modality (ct, mri, etc.)")
+@click.option("--replace", is_flag=True,
+              help="Explicitly replace an existing dataset (atomic mode only)")
 @click.option("--atomic/--no-atomic", default=True,
               help="Publish through a staging prefix and publish lock")
 @click.option("--no-skip", is_flag=True,
@@ -513,9 +526,13 @@ def store_doctor_cmd(path, output):
 @click.option("--dry-run", is_flag=True, help="Scan and plan without S3 writes")
 @click.option("--skip-dicom-checks", is_flag=True, help="Skip pre-publish DICOM sanity checks")
 @click.pass_context
-def publish(ctx, dataset_id, source, metadata, modality, atomic, no_skip, dry_run,
-            skip_dicom_checks):
+def publish(ctx, dataset_id, source, metadata, privacy_unit_column, label_column,
+            modality, replace, atomic, no_skip, dry_run, skip_dicom_checks):
     """Publish a local dataset to S3/MinIO."""
+    if not atomic:
+        raise click.ClickException(
+            "non-atomic dataset publishing is disabled"
+        )
     try:
         validate_dataset_id(dataset_id)
     except ValueError as e:
@@ -524,6 +541,11 @@ def publish(ctx, dataset_id, source, metadata, modality, atomic, no_skip, dry_ru
     s3 = ctx.obj["s3"]
     bucket = ctx.obj["bucket"]
     prefix = f"datasets/{dataset_id}"
+    existing_objects = list_objects(s3, bucket, f"{prefix}/")
+    if existing_objects and not replace:
+        raise click.ClickException(
+            "dataset already exists; use --replace for an explicit atomic replacement"
+        )
 
     click.echo(f"Publishing dataset: {dataset_id}")
     click.echo(f"  Source: {os.path.abspath(source)}")
@@ -552,7 +574,17 @@ def publish(ctx, dataset_id, source, metadata, modality, atomic, no_skip, dry_ru
             raise click.ClickException(str(e)) from e
         click.echo(f"  Metadata columns: {', '.join(extra_metadata.column_names)}")
 
-    skip_enabled = not no_skip
+    try:
+        build_samples_metadata(
+            samples, extra_metadata=extra_metadata,
+            privacy_unit_col=privacy_unit_column, label_col=label_column,
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+
+    # Replacement must stage every desired source object; otherwise a matching
+    # object skipped from staging could be mistaken for stale historical data.
+    skip_enabled = not no_skip and not replace
     sample_uploads, sample_skips = _partition_uploads(s3, bucket, prefix, samples,
                                                       source_path="images",
                                                       enabled=skip_enabled)
@@ -566,13 +598,42 @@ def publish(ctx, dataset_id, source, metadata, modality, atomic, no_skip, dry_ru
         click.echo(click.style("Dry run complete; no S3 writes performed.", fg="green"))
         return
 
-    if atomic:
-        _atomic_upload_sources(s3, bucket, prefix, sample_uploads, mask_uploads)
-    else:
-        _upload_sources(s3, bucket, prefix, sample_uploads, mask_uploads)
+    transaction = None
+    try:
+        if atomic:
+            transaction = _atomic_upload_sources(
+                s3, bucket, prefix, sample_uploads, mask_uploads,
+                replace=replace, require_empty=not replace,
+            )
+        else:
+            _upload_sources(s3, bucket, prefix, sample_uploads, mask_uploads)
 
-    _write_dataset_artifacts(s3, bucket, prefix, dataset_id, modality, samples,
-                             masks=masks, extra_metadata=extra_metadata)
+        transaction["mutated"] = True
+        published_objects = list_objects(
+            s3, bucket, f"{prefix}/source/images/")
+        published_mask_objects = list_objects(
+            s3, bucket, f"{prefix}/source/masks/")
+        published_samples = scan_s3_images(
+            s3, bucket, prefix, published_objects)
+        published_masks = scan_s3_masks(
+            s3, bucket, prefix, published_mask_objects,
+            sample_ids=[sample["sample_id"] for sample in published_samples],
+        )
+        _write_dataset_artifacts(
+            s3, bucket, prefix, dataset_id, modality, published_samples,
+            masks=published_masks, extra_metadata=extra_metadata,
+            privacy_unit_col=privacy_unit_column, label_col=label_column,
+            publish_lock=transaction["publish_lock"],
+        )
+    except Exception:
+        if transaction is not None:
+            _finish_atomic_publish(s3, bucket, prefix, transaction, commit=False)
+        raise
+    else:
+        if transaction is not None:
+            if not _finish_atomic_publish(
+                    s3, bucket, prefix, transaction, commit=True):
+                raise RuntimeError("dataset publication lock ownership was lost")
 
     click.echo("")
     click.echo(click.style(f"Dataset '{dataset_id}' published!", fg="green", bold=True))
@@ -593,7 +654,8 @@ def list_cmd(ctx, output, controller_url, skip_controller):
     if ctrl_url and not (skip_controller or ctx.obj.get("skip_controller")):
         try:
             datasets = _merge_controller_datasets(
-                datasets, controller_api.datasets(ctrl_url)
+                datasets, controller_api.datasets(
+                    ctrl_url, token=ctx.obj.get("controller_token"))
             )
         except Exception as e:
             if output == "text":
@@ -611,7 +673,7 @@ def list_cmd(ctx, output, controller_url, skip_controller):
         extras = []
         if ds.get("dirty"):
             extras.append(click.style("dirty", fg="yellow"))
-        if ds.get("last_error"):
+        if ds.get("has_error"):
             extras.append(click.style("error", fg="red"))
         suffix = f" ({', '.join(extras)})" if extras else ""
         click.echo(f"  {ds['dataset_id']} [{click.style(ds['status'], fg=status_color)}]{suffix}")
@@ -653,6 +715,7 @@ def status(ctx, dataset_id, controller_url, skip_controller, output):
     payload = _dataset_status(
         ctx.obj["s3"], ctx.obj["bucket"], dataset_id,
         controller_url=controller_url or ctx.obj.get("controller_url"),
+        controller_token=ctx.obj.get("controller_token"),
         skip_controller=skip_controller or ctx.obj.get("skip_controller"),
     )
     if output == "json":
@@ -669,8 +732,8 @@ def status(ctx, dataset_id, controller_url, skip_controller, output):
     if payload.get("controller"):
         ctrl = payload["controller"]
         click.echo(f"  Dirty:        {ctrl.get('dirty', False)}")
-        if ctrl.get("last_error"):
-            click.echo(f"  Last error:   {ctrl['last_error']}")
+        if ctrl.get("has_error"):
+            click.echo("  Last reconcile error: yes (see controller logs)")
 
 
 @dataset_group.command("verify")
@@ -768,6 +831,8 @@ def copy_cmd(ctx, src_id, dst_id, yes, replace):
     """Server-side copy a dataset's source objects and rebuild artifacts."""
     _validate_dataset_cli(src_id)
     _validate_dataset_cli(dst_id)
+    if src_id == dst_id:
+        raise click.ClickException("source and destination datasets must differ")
     if not yes:
         raise click.ClickException("Refusing to copy without --yes")
     s3 = ctx.obj["s3"]
@@ -777,23 +842,71 @@ def copy_cmd(ctx, src_id, dst_id, yes, replace):
     existing = list_objects(s3, bucket, f"{dst_prefix}/")
     if existing and not replace:
         raise click.ClickException("destination exists; use --replace")
-    if existing:
-        delete_keys(s3, bucket, [obj["key"] for obj in existing])
-    sources = list_objects(s3, bucket, f"{src_prefix}/source/")
-    if not sources:
-        raise click.ClickException("source dataset has no source objects")
-    for obj in sources:
-        suffix = obj["key"][len(src_prefix):]
-        copy_object(s3, bucket, obj["key"], f"{dst_prefix}{suffix}")
-    objects = list_objects(s3, bucket, f"{dst_prefix}/source/images/")
-    masks_objects = list_objects(s3, bucket, f"{dst_prefix}/source/masks/")
-    samples = scan_s3_images(s3, bucket, dst_prefix, objects)
-    masks = scan_s3_masks(s3, bucket, dst_prefix, masks_objects,
-                          sample_ids=[sample["sample_id"] for sample in samples])
-    modality = _existing_modality(s3, bucket, src_prefix, fallback="unknown")
-    extra_metadata = _read_existing_samples_metadata(s3, bucket, src_prefix)
-    _write_dataset_artifacts(s3, bucket, dst_prefix, dst_id, modality, samples,
-                             masks=masks, extra_metadata=extra_metadata)
+    source_lock = None
+    transaction = None
+    try:
+        try:
+            source_lock = _acquire_publish_lock(
+                s3, bucket, src_prefix, status="copy-source")
+        except Exception as exc:
+            raise click.ClickException(
+                "source dataset has an active publication"
+            ) from exc
+        source_manifest = _read_manifest_strict(s3, bucket, src_prefix)
+        contract = metadata_contract_from_manifest(source_manifest)
+        sources = list_objects(s3, bucket, f"{src_prefix}/source/")
+        if not sources:
+            raise click.ClickException("source dataset has no source objects")
+        extra_metadata = _read_existing_samples_metadata(s3, bucket, src_prefix)
+        transaction = _atomic_upload_sources(
+            s3, bucket, dst_prefix, [], [], replace=False,
+            require_empty=not replace,
+        )
+        current = [
+            obj["key"] for obj in list_objects(
+                s3, bucket, f"{dst_prefix}/")
+            if obj["key"] != f"{dst_prefix}/{PUBLISH_LOCK}"
+            and not obj["key"].startswith(f"{dst_prefix}/.staging-")
+            and not obj["key"].startswith(f"{dst_prefix}/.backup-")
+        ]
+        if current and not replace:
+            raise RuntimeError("destination changed while copy was starting")
+        transaction["mutated"] = True
+        if current:
+            _delete_keys_exact(s3, bucket, current)
+        for obj in sources:
+            suffix = obj["key"][len(src_prefix):]
+            copy_object(s3, bucket, obj["key"], f"{dst_prefix}{suffix}")
+        if _object_inventory(sources) != _object_inventory(list_objects(
+                s3, bucket, f"{src_prefix}/source/")):
+            raise RuntimeError("source dataset changed while it was being copied")
+        objects = list_objects(s3, bucket, f"{dst_prefix}/source/images/")
+        masks_objects = list_objects(s3, bucket, f"{dst_prefix}/source/masks/")
+        samples = scan_s3_images(s3, bucket, dst_prefix, objects)
+        masks = scan_s3_masks(
+            s3, bucket, dst_prefix, masks_objects,
+            sample_ids=[sample["sample_id"] for sample in samples])
+        _write_dataset_artifacts(
+            s3, bucket, dst_prefix, dst_id,
+            source_manifest.get("modality") or "unknown", samples,
+            masks=masks, extra_metadata=extra_metadata,
+            privacy_unit_col=contract["privacy_unit_col"],
+            label_col=contract.get("label_col"),
+            existing_manifest=source_manifest,
+            publish_lock=transaction["publish_lock"],
+        )
+    except Exception:
+        if transaction is not None:
+            _finish_atomic_publish(
+                s3, bucket, dst_prefix, transaction, commit=False)
+        raise
+    else:
+        if not _finish_atomic_publish(
+                s3, bucket, dst_prefix, transaction, commit=True):
+            raise RuntimeError("destination publication lock ownership was lost")
+    finally:
+        if source_lock is not None:
+            _release_publish_lock(s3, bucket, source_lock)
     click.echo(click.style(f"Copied {src_id} -> {dst_id}", fg="green"))
     click.echo(f"  Source objects: {len(sources)}")
     click.echo(f"  Samples:        {len(samples)}")
@@ -807,7 +920,27 @@ def rescan(ctx, dataset_id):
     """Re-scan and update indexes for a dataset from current S3 contents."""
     _validate_dataset_cli(dataset_id)
     click.echo(f"Rescanning: {dataset_id}")
-    counts = _rescan_dataset_artifacts(ctx.obj["s3"], ctx.obj["bucket"], dataset_id)
+    s3 = ctx.obj["s3"]
+    bucket = ctx.obj["bucket"]
+    prefix = f"datasets/{dataset_id}"
+    transaction = None
+    try:
+        transaction = _atomic_upload_sources(
+            s3, bucket, prefix, [], [], replace=False)
+        transaction["mutated"] = True
+        counts = _rescan_dataset_artifacts(
+            s3, bucket, dataset_id,
+            publish_lock=transaction["publish_lock"],
+        )
+    except Exception:
+        if transaction is not None:
+            _finish_atomic_publish(
+                s3, bucket, prefix, transaction, commit=False)
+        raise
+    else:
+        if not _finish_atomic_publish(
+                s3, bucket, prefix, transaction, commit=True):
+            raise RuntimeError("dataset publication lock ownership was lost")
     click.echo(f"  Found {counts['objects']} objects under source/images/")
     click.echo(f"  Found {counts['mask_objects']} objects under source/masks/")
     click.echo(f"  Index updated: {counts['samples']} samples, {counts['masks']} masks")
@@ -825,7 +958,8 @@ def reconcile(ctx, dataset_id, controller_url):
     if not ctrl_url:
         raise click.ClickException("No controller URL configured")
     try:
-        payload = controller_api.reconcile(ctrl_url, dataset_id)
+        payload = controller_api.reconcile(
+            ctrl_url, dataset_id, token=ctx.obj.get("controller_token"))
     except Exception as e:
         raise click.ClickException(str(e)) from e
     _echo_json(payload)
@@ -871,6 +1005,10 @@ def modify(ctx, dataset_id, metadata, add_images, add_masks, dry_run, yes):
     prefix = f"datasets/{dataset_id}"
     if not head_object(s3, bucket, f"{prefix}/manifest.yaml"):
         raise click.ClickException(f"Dataset '{dataset_id}' is not published")
+    try:
+        metadata_contract_from_manifest(_read_manifest_strict(s3, bucket, prefix))
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
 
     extra_metadata = None
     if metadata:
@@ -917,12 +1055,31 @@ def modify(ctx, dataset_id, metadata, add_images, add_masks, dry_run, yes):
         click.echo(click.style("Dry run complete; no S3 writes performed.", fg="green"))
         return
 
-    for sample in sample_uploads:
-        _upload_sample(s3, bucket, prefix, sample, "images")
-    for mask in mask_uploads:
-        _upload_sample(s3, bucket, prefix, mask, "masks")
-    counts = _rescan_dataset_artifacts(s3, bucket, dataset_id,
-                                       extra_metadata=extra_metadata)
+    transaction = None
+    try:
+        # Upload every requested local object after acquiring the lock. Entries
+        # classified as skips during planning are included so a concurrent
+        # pre-lock change cannot silently omit part of the requested update.
+        transaction = _atomic_upload_sources(
+            s3, bucket, prefix,
+            sample_uploads + sample_skips,
+            mask_uploads + mask_skips,
+            replace=False,
+        )
+        transaction["mutated"] = True
+        counts = _rescan_dataset_artifacts(
+            s3, bucket, dataset_id, extra_metadata=extra_metadata,
+            publish_lock=transaction["publish_lock"],
+        )
+    except Exception:
+        if transaction is not None:
+            _finish_atomic_publish(
+                s3, bucket, prefix, transaction, commit=False)
+        raise
+    else:
+        if not _finish_atomic_publish(
+                s3, bucket, prefix, transaction, commit=True):
+            raise RuntimeError("dataset publication lock ownership was lost")
     click.echo(
         click.style(
             f"Dataset '{dataset_id}' modified: "
@@ -959,7 +1116,8 @@ def _validate_dataset_cli(dataset_id: str) -> None:
 
 
 def _rescan_dataset_artifacts(s3, bucket: str, dataset_id: str,
-                              extra_metadata=None) -> dict:
+                              extra_metadata=None, *,
+                              publish_lock: dict | None = None) -> dict:
     prefix = f"datasets/{dataset_id}"
     objects = list_objects(s3, bucket, f"{prefix}/source/images/")
     mask_objects = list_objects(s3, bucket, f"{prefix}/source/masks/")
@@ -968,11 +1126,22 @@ def _rescan_dataset_artifacts(s3, bucket: str, dataset_id: str,
         raise click.ClickException("No supported image objects found.")
     masks = scan_s3_masks(s3, bucket, prefix, mask_objects,
                           sample_ids=[sample["sample_id"] for sample in samples])
-    modality = _existing_modality(s3, bucket, prefix, fallback="unknown")
+    try:
+        existing_manifest = _read_manifest_strict(s3, bucket, prefix)
+        contract = metadata_contract_from_manifest(existing_manifest)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
     if extra_metadata is None:
         extra_metadata = _read_existing_samples_metadata(s3, bucket, prefix)
-    _write_dataset_artifacts(s3, bucket, prefix, dataset_id, modality, samples,
-                             masks=masks, extra_metadata=extra_metadata)
+    _write_dataset_artifacts(
+        s3, bucket, prefix, dataset_id,
+        existing_manifest.get("modality") or "unknown", samples,
+        masks=masks, extra_metadata=extra_metadata,
+        privacy_unit_col=contract["privacy_unit_col"],
+        label_col=contract.get("label_col"),
+        existing_manifest=existing_manifest,
+        publish_lock=publish_lock,
+    )
     return {
         "objects": len(objects),
         "mask_objects": len(mask_objects),
@@ -1026,6 +1195,18 @@ def _all_keys_exist(s3, bucket: str, keys: list[str]) -> bool:
     return all(head_object(s3, bucket, key) for key in keys)
 
 
+def _object_inventory(objects: list[dict]) -> list[tuple]:
+    return sorted(
+        (obj["key"], int(obj.get("size", 0)), obj.get("etag"))
+        for obj in objects
+    )
+
+
+def _delete_keys_exact(s3, bucket: str, keys: list[str]) -> None:
+    if keys and delete_keys(s3, bucket, keys) != len(keys):
+        raise RuntimeError("S3 object deletion was incomplete")
+
+
 def _upload_sources(s3, bucket: str, prefix: str,
                     samples: list[dict], masks: list[dict]) -> None:
     click.echo("  Uploading source objects to S3...")
@@ -1036,37 +1217,144 @@ def _upload_sources(s3, bucket: str, prefix: str,
 
 
 def _atomic_upload_sources(s3, bucket: str, prefix: str,
-                           samples: list[dict], masks: list[dict]) -> None:
+                           samples: list[dict], masks: list[dict], *,
+                           replace: bool = False,
+                           require_empty: bool = False) -> dict:
     staging_prefix = f"{prefix}/.staging-{uuid.uuid4().hex}"
-    lock_key = f"{prefix}/{PUBLISH_LOCK}"
-    copied_keys: list[str] = []
+    backup_prefix = f"{prefix}/.backup-{uuid.uuid4().hex}"
     click.echo(f"  Publishing through staging prefix: {staging_prefix}")
-    put_object_bytes(
-        s3, bucket, lock_key,
-        json.dumps({"status": "publishing", "staging_prefix": staging_prefix}).encode(),
-        content_type="application/json",
-    )
     try:
+        publish_lock = _acquire_publish_lock(
+            s3, bucket, prefix, status="publishing",
+            staging_prefix=staging_prefix,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "dataset already has an active atomic publication"
+        ) from exc
+    mutated = False
+    try:
+        previous = [
+            obj for obj in list_objects(s3, bucket, f"{prefix}/")
+            if obj["key"] != publish_lock["key"]
+            and not obj["key"].startswith(f"{prefix}/.staging-")
+            and not obj["key"].startswith(f"{prefix}/.backup-")
+        ]
+        if require_empty and previous:
+            raise RuntimeError(
+                "dataset already exists; explicit replacement is required"
+            )
+        for obj in previous:
+            suffix = obj["key"][len(prefix):]
+            copy_object(s3, bucket, obj["key"], f"{backup_prefix}{suffix}")
         for sample in samples:
             _upload_sample(s3, bucket, staging_prefix, sample, "images")
         for mask in masks:
             _upload_sample(s3, bucket, staging_prefix, mask, "masks")
         staged = list_objects(s3, bucket, f"{staging_prefix}/")
+        # All prior objects are now safely backed up. Only from this point may
+        # rollback replace the canonical prefix from that backup.
+        mutated = bool(staged)
         for obj in staged:
             suffix = obj["key"][len(staging_prefix):]
             dest_key = f"{prefix}{suffix}"
             copy_object(s3, bucket, obj["key"], dest_key)
-            copied_keys.append(dest_key)
-        delete_keys(s3, bucket, [obj["key"] for obj in staged])
+        if replace:
+            staged_destinations = {
+                f"{prefix}{obj['key'][len(staging_prefix):]}" for obj in staged
+            }
+            stale_sources = [
+                obj["key"] for obj in previous
+                if f"{prefix}/source/" in obj["key"]
+                and obj["key"] not in staged_destinations
+            ]
+            if stale_sources:
+                mutated = True
+                _delete_keys_exact(s3, bucket, stale_sources)
     except Exception:
-        if copied_keys:
-            delete_keys(s3, bucket, copied_keys)
-        staged = list_objects(s3, bucket, f"{staging_prefix}/")
-        if staged:
-            delete_keys(s3, bucket, [obj["key"] for obj in staged])
-        delete_keys(s3, bucket, [lock_key])
+        transaction = {
+            "staging_prefix": staging_prefix,
+            "backup_prefix": backup_prefix,
+            "mutated": mutated,
+            "publish_lock": publish_lock,
+        }
+        _finish_atomic_publish(s3, bucket, prefix, transaction, commit=False)
         raise
-    delete_keys(s3, bucket, [lock_key])
+    return {
+        "staging_prefix": staging_prefix,
+        "backup_prefix": backup_prefix,
+        "mutated": mutated,
+        "publish_lock": publish_lock,
+    }
+
+
+def _finish_atomic_publish(s3, bucket: str, prefix: str,
+                           transaction: dict, *, commit: bool) -> bool:
+    staging_prefix = transaction["staging_prefix"]
+    backup_prefix = transaction["backup_prefix"]
+    publish_lock = transaction["publish_lock"]
+    lock_key = publish_lock["key"]
+    staged = list_objects(s3, bucket, f"{staging_prefix}/")
+    backups = list_objects(s3, bucket, f"{backup_prefix}/")
+    if not _publish_lock_is_owned(s3, bucket, publish_lock):
+        # Another owner now controls recovery. Preserve this transaction's
+        # uniquely named staging and backup snapshots for operator inspection.
+        return False
+    if not commit and transaction.get("mutated", False):
+        current = [
+            obj["key"] for obj in list_objects(s3, bucket, f"{prefix}/")
+            if obj["key"] != lock_key
+            and not obj["key"].startswith(f"{prefix}/.staging-")
+            and not obj["key"].startswith(f"{prefix}/.backup-")
+        ]
+        if current:
+            _delete_keys_exact(s3, bucket, current)
+        for obj in backups:
+            suffix = obj["key"][len(backup_prefix):]
+            copy_object(s3, bucket, obj["key"], f"{prefix}{suffix}")
+    cleanup = [obj["key"] for obj in staged + backups]
+    if cleanup:
+        _delete_keys_exact(s3, bucket, cleanup)
+    return _release_publish_lock(s3, bucket, publish_lock)
+
+
+def _acquire_publish_lock(s3, bucket: str, prefix: str, *, status: str,
+                          staging_prefix: str | None = None) -> dict:
+    """Create and identify one dataset-scoped publication lock."""
+    owner = uuid.uuid4().hex
+    key = f"{prefix}/{PUBLISH_LOCK}"
+    payload = {"status": status, "owner": owner}
+    if staging_prefix is not None:
+        payload["staging_prefix"] = staging_prefix
+    response = put_object_bytes(
+        s3, bucket, key, json.dumps(payload).encode("utf-8"),
+        content_type="application/json", if_absent=True,
+    )
+    return {"key": key, "owner": owner, "etag": response.get("ETag")}
+
+
+def _release_publish_lock(s3, bucket: str, publish_lock: dict) -> bool:
+    """Release a lock only while both its owner and object ETag still match."""
+    key = publish_lock["key"]
+    if not _publish_lock_is_owned(s3, bucket, publish_lock):
+        return False
+    kwargs = {"Bucket": bucket, "Key": key}
+    if publish_lock.get("etag"):
+        kwargs["IfMatch"] = publish_lock["etag"]
+    try:
+        s3.delete_object(**kwargs)
+    except Exception:
+        return False
+    return True
+
+
+def _publish_lock_is_owned(s3, bucket: str, publish_lock: dict) -> bool:
+    try:
+        current = json.loads(get_object_bytes(
+            s3, bucket, publish_lock["key"]))
+    except Exception:
+        return False
+    return current.get("owner") == publish_lock["owner"]
 
 
 def _upload_sample(s3, bucket: str, prefix: str, sample: dict, source_path: str) -> None:
@@ -1085,7 +1373,11 @@ def _upload_sample(s3, bucket: str, prefix: str, sample: dict, source_path: str)
 def _write_dataset_artifacts(s3, bucket: str, prefix: str, dataset_id: str,
                              modality: str, samples: list[dict],
                              masks: list[dict] | None = None,
-                             extra_metadata=None) -> None:
+                             extra_metadata=None, *,
+                             privacy_unit_col: str,
+                             label_col: str | None = None,
+                             existing_manifest: dict | None = None,
+                             publish_lock: dict | None = None) -> None:
     import pyarrow.parquet as pq
 
     masks = masks or []
@@ -1094,33 +1386,54 @@ def _write_dataset_artifacts(s3, bucket: str, prefix: str, dataset_id: str,
         idx = build_hash_index(samples, bucket, prefix)
         idx_path = os.path.join(tmpdir, "content_hash_index.parquet")
         pq.write_table(idx, idx_path)
-        s3.upload_file(idx_path, bucket, f"{prefix}/indexes/content_hash_index.parquet")
 
+        mask_idx_path = None
         if masks:
             click.echo("  Building mask content hash index...")
             mask_idx = build_mask_hash_index(masks, bucket, prefix)
             mask_idx_path = os.path.join(tmpdir, "masks_content_hash_index.parquet")
             pq.write_table(mask_idx, mask_idx_path)
-            s3.upload_file(mask_idx_path, bucket,
-                           f"{prefix}/indexes/masks_content_hash_index.parquet")
 
         click.echo("  Building sample manifests...")
         sm = build_sample_manifests(samples)
         sm_path = os.path.join(tmpdir, "sample_manifests.parquet")
         pq.write_table(sm, sm_path)
-        s3.upload_file(sm_path, bucket, f"{prefix}/metadata/sample_manifests.parquet")
 
         click.echo("  Building samples metadata...")
-        meta = build_samples_metadata(samples, extra_metadata=extra_metadata)
+        meta = build_samples_metadata(
+            samples, extra_metadata=extra_metadata,
+            privacy_unit_col=privacy_unit_col, label_col=label_col,
+        )
         meta_path = os.path.join(tmpdir, "samples.parquet")
         pq.write_table(meta, meta_path)
-        s3.upload_file(meta_path, bucket, f"{prefix}/metadata/samples.parquet")
 
         click.echo("  Building manifest...")
-        manifest = generate_manifest(dataset_id, bucket, prefix, modality,
-                                     has_masks=bool(masks))
+        manifest = generate_manifest(
+            dataset_id, bucket, prefix, modality, has_masks=bool(masks),
+            privacy_unit_col=privacy_unit_col, label_col=label_col,
+            existing_manifest=existing_manifest,
+        )
         manifest_path = os.path.join(tmpdir, "manifest.yaml")
         write_manifest_yaml(manifest, manifest_path)
+
+        # Upload all derived data first. The manifest is the publication marker
+        # and is deliberately written last.
+        if (publish_lock is not None and
+                not _publish_lock_is_owned(s3, bucket, publish_lock)):
+            raise RuntimeError("dataset publication lock ownership was lost")
+        s3.upload_file(idx_path, bucket, f"{prefix}/indexes/content_hash_index.parquet")
+        if mask_idx_path:
+            s3.upload_file(mask_idx_path, bucket,
+                           f"{prefix}/indexes/masks_content_hash_index.parquet")
+        else:
+            stale_mask_index = f"{prefix}/indexes/masks_content_hash_index.parquet"
+            if head_object(s3, bucket, stale_mask_index):
+                _delete_keys_exact(s3, bucket, [stale_mask_index])
+        s3.upload_file(sm_path, bucket, f"{prefix}/metadata/sample_manifests.parquet")
+        s3.upload_file(meta_path, bucket, f"{prefix}/metadata/samples.parquet")
+        if (publish_lock is not None and
+                not _publish_lock_is_owned(s3, bucket, publish_lock)):
+            raise RuntimeError("dataset publication lock ownership was lost")
         s3.upload_file(manifest_path, bucket, f"{prefix}/manifest.yaml")
 
 
@@ -1128,13 +1441,16 @@ def _read_existing_samples_metadata(s3, bucket: str, prefix: str):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    try:
-        data = get_object_bytes(s3, bucket, f"{prefix}/metadata/samples.parquet")
-        if not data:
-            return None
-        return pq.read_table(pa.BufferReader(data))
-    except Exception:
+    key = f"{prefix}/metadata/samples.parquet"
+    if not head_object(s3, bucket, key):
         return None
+    data = get_object_bytes(s3, bucket, key)
+    if not data:
+        raise ValueError("samples metadata is empty")
+    try:
+        return pq.read_table(pa.BufferReader(data))
+    except Exception as exc:
+        raise ValueError("samples metadata is corrupt") from exc
 
 
 def _existing_modality(s3, bucket: str, prefix: str, fallback: str) -> str:
@@ -1156,6 +1472,20 @@ def _read_manifest(s3, bucket: str, prefix: str) -> dict | None:
         return None
 
 
+def _read_manifest_strict(s3, bucket: str, prefix: str) -> dict:
+    key = f"{prefix}/manifest.yaml"
+    if not head_object(s3, bucket, key):
+        raise ValueError("dataset manifest is missing")
+    try:
+        import yaml
+        manifest = yaml.safe_load(get_object_bytes(s3, bucket, key))
+    except Exception as exc:
+        raise ValueError("dataset manifest is corrupt") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("dataset manifest must be a mapping")
+    return manifest
+
+
 def _parquet_row_count(s3, bucket: str, key: str) -> int | None:
     try:
         import pyarrow as pa
@@ -1167,7 +1497,9 @@ def _parquet_row_count(s3, bucket: str, key: str) -> int | None:
 
 
 def _dataset_status(s3, bucket: str, dataset_id: str,
-                    controller_url: str | None, skip_controller: bool) -> dict:
+                    controller_url: str | None,
+                    controller_token: str | None,
+                    skip_controller: bool) -> dict:
     prefix = f"datasets/{dataset_id}"
     manifest_meta = head_object(s3, bucket, f"{prefix}/manifest.yaml")
     image_objects = list_objects(s3, bucket, f"{prefix}/source/images/")
@@ -1193,7 +1525,8 @@ def _dataset_status(s3, bucket: str, dataset_id: str,
     }
     if controller_url and not skip_controller:
         try:
-            for item in controller_api.datasets(controller_url):
+            for item in controller_api.datasets(
+                    controller_url, token=controller_token):
                 if item.get("dataset_id") == dataset_id:
                     payload["controller"] = item
                     break
@@ -1247,30 +1580,14 @@ def _doctor_result(ctx, controller_url: str | None, skip_controller: bool) -> di
     if ctrl_url and not (skip_controller or ctx.obj.get("skip_controller")):
         try:
             controller_payload = controller_api.health(ctrl_url)
-            detail = (
-                f"bucket={controller_payload.get('bucket')}, "
-                f"dirty={len(controller_payload.get('dirty_datasets', []))}, "
-                f"errors={len(controller_payload.get('last_errors', {}))}"
-            )
-            add("Controller health", "OK", detail)
-            controller_datasets = controller_api.datasets(ctrl_url)
-            add("Controller datasets", "OK", str(len(controller_datasets)))
-            if controller_payload.get("bucket") == bucket:
-                add("Controller bucket", "OK", bucket)
+            add("Controller health", "OK", controller_payload.get("status", "ok"))
+            controller_token = ctx.obj.get("controller_token")
+            if controller_token:
+                controller_datasets = controller_api.datasets(
+                    ctrl_url, token=controller_token)
+                add("Controller datasets", "OK", str(len(controller_datasets)))
             else:
-                add("Controller bucket", "WARN",
-                    f"controller={controller_payload.get('bucket')} cli={bucket}")
-            webhook_prefix = controller_payload.get("webhook_prefix")
-            add("Controller webhook prefix",
-                "OK" if webhook_prefix == "datasets/" else "WARN",
-                str(webhook_prefix))
-            expected = {"datasets/<dataset_id>/source/images/",
-                        "datasets/<dataset_id>/source/masks/"}
-            advertised = set(controller_payload.get("source_prefixes", []))
-            if expected.issubset(advertised):
-                add("Controller source prefixes", "OK", "images and masks")
-            else:
-                add("Controller source prefixes", "WARN", f"advertised={sorted(advertised)}")
+                add("Controller operator API", "WARN", "token not configured")
         except Exception as e:
             add("Controller health", "WARN", str(e))
 
@@ -1303,8 +1620,8 @@ def _merge_controller_datasets(s3_datasets: list[dict],
         merged.update({
             "status": item.get("status", merged.get("status", "unknown")),
             "dirty": item.get("dirty", False),
-            "last_reconcile": item.get("last_reconcile"),
-            "last_error": item.get("last_error"),
+            "last_reconcile_at": item.get("last_reconcile_at"),
+            "has_error": item.get("has_error", False),
         })
     return sorted(by_id.values(), key=lambda item: item["dataset_id"])
 

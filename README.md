@@ -62,6 +62,8 @@ dsimaging-admin dataset publish \
   --dataset-id study_ct_v1 \
   --source /data/study_ct \
   --metadata /data/study_ct/clinical.csv \
+  --privacy-unit-column patient_id \
+  --label-column diagnosis \
   --modality ct
 
 # Inspect and verify.
@@ -122,7 +124,8 @@ dsimaging-admin doctor --output json
 3. Computes SHA-256 content hashes.
 4. Skips uploads that already match the current dataset hash indexes.
 5. Uploads through `datasets/<id>/.staging-*` and a `.publish-lock`, then copies
-   into `datasets/<id>/source/...`.
+   into `datasets/<id>/source/...`; derived objects are generated before upload
+   and `manifest.yaml` is written last.
 6. Generates and uploads:
    - `manifest.yaml`
    - `indexes/content_hash_index.parquet`
@@ -130,14 +133,41 @@ dsimaging-admin doctor --output json
    - `metadata/sample_manifests.parquet`
    - `metadata/samples.parquet`
 
-Use `--dry-run` to scan and show the upload plan without S3 writes, `--no-skip`
-to force uploads, or `--no-atomic` to disable staging.
+Use `--dry-run` to scan and show the upload plan without S3 writes or
+`--no-skip` to force uploads. Published datasets always use staging and an
+atomic publication lock; `--no-atomic` is retained only to produce an explicit
+compatibility error.
+
+Every publication pins this disclosure-control contract under `manifest.yaml`'s
+`metadata` mapping:
+
+```yaml
+id_col: sample_id
+privacy_unit: patient
+privacy_unit_col: patient_id
+privacy_unit_canonicalization: trim-utf8-v2
+label_col: diagnosis  # omitted when --label-column is not supplied
+```
+
+`--privacy-unit-column` is required. Every discovered sample must have a
+non-empty value in that metadata column and, when declared, in `--label-column`.
+The metadata `sample_id` roster must match the discovered image roster exactly;
+duplicates, missing rows and unrelated extra rows are rejected. The patient and
+optional label columns must be dedicated columns, while multiple distinct
+samples may belong to the same patient. Publishing to any existing dataset is
+rejected by default. Use `--replace` for an explicit atomic replacement; it
+stages the full new source set, removes stale historical source objects, retains
+a rollback copy until the new manifest succeeds.
 
 `dataset modify` never deletes existing objects. `--metadata` validates and
 replaces the metadata parquet after confirmation, `--add-images` and
 `--add-masks` upload new content-addressed objects when the current hash indexes
 do not already contain them, then the dataset indexes and manifest are rebuilt
-from S3. Use `--dry-run` to list planned uploads without writing.
+from S3. Rescan, copy and modify use the same owned dataset lock and rollback
+path. Copy also holds the source collection stable while taking its snapshot.
+They preserve the pinned metadata contract and other manifest fields;
+incomplete replacement metadata fails without rewriting the manifest. Use
+`--dry-run` to list planned uploads without writing.
 
 ## Configuration
 
@@ -150,6 +180,7 @@ profiles:
     backend: auto
     endpoint: http://127.0.0.1:9000
     controller_url: http://127.0.0.1:8080
+    controller_token: <operator token>
     bucket: imaging-data
     access_key: minioadmin
     secret_key: minioadmin123
@@ -165,11 +196,30 @@ Environment variables override profile values:
 | `DSIMAGING_PROFILE` | `default` | Config profile |
 | `DSIMAGING_ENDPOINT` | `http://127.0.0.1:9000` | S3/MinIO endpoint |
 | `DSIMAGING_CONTROLLER_URL` | (empty) | dsimaging-store controller URL |
+| `DSIMAGING_CONTROLLER_TOKEN` | (empty) | Bearer token for controller inventory and manual reconcile |
 | `DSIMAGING_ACCESS_KEY` | `minioadmin` | S3 access key |
 | `DSIMAGING_SECRET_KEY` | `minioadmin123` | S3 secret key |
 | `DSIMAGING_BUCKET` | `imaging-data` | Bucket name |
 | `DSIMAGING_REGION` | (empty) | S3 region |
 | `DSIMAGING_BACKEND` | `auto` | Backend override: `auto`, `minio`, `aws` or `s3-compatible` |
+
+`store init` generates a controller token in the project's `.env`, whose mode
+is set to `0600`. Pass that value through `DSIMAGING_CONTROLLER_TOKEN` (or the
+profile key above) when using `dataset list`, `dataset status`, `dataset
+reconcile`, `doctor`, or the operator UI with the controller. The controller's
+unauthenticated health endpoint reports only coarse liveness; inventory and
+manual reconciliation remain disabled until a token is configured. For a
+manually deployed MinIO or AWS controller, generate and configure the same
+long random value on both sides.
+
+Generated local Compose projects publish the controller on `127.0.0.1` only;
+MinIO delivers notifications over the internal Compose network.
+
+`dataset verify` checks the published manifest and its pinned patient contract,
+the exact image/metadata/sample-manifest roster, mask mappings, index entries,
+and selected object hashes. Missing, extra, duplicate, orphaned, or corrupt
+publication metadata makes verification fail rather than accepting a reduced
+view of the collection.
 
 ## Dataset layout in S3
 

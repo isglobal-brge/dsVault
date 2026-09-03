@@ -31,12 +31,17 @@ import requests
 
 from dsimaging_admin import controller as controller_api
 from dsimaging_admin.cli import (
+    _atomic_upload_sources,
+    _finish_atomic_publish,
     _partition_uploads,
+    _read_manifest_strict,
     _read_existing_samples_metadata,
-    _upload_sample,
+    _rescan_dataset_artifacts,
     _write_dataset_artifacts,
 )
 from dsimaging_admin.manifest import (
+    build_samples_metadata,
+    metadata_contract_from_manifest,
     read_metadata_table,
     scan_images,
     scan_masks,
@@ -134,6 +139,8 @@ def load_profiles(path: str | None = None) -> dict[str, dict]:
                 "secret_key": os.environ.get("DSIMAGING_SECRET_KEY", "minioadmin123"),
                 "region": os.environ.get("DSIMAGING_REGION", ""),
                 "controller_url": os.environ.get("DSIMAGING_CONTROLLER_URL", ""),
+                "controller_token": os.environ.get(
+                    "DSIMAGING_CONTROLLER_TOKEN", ""),
                 "backend": os.environ.get("DSIMAGING_BACKEND", "auto"),
             }
         }
@@ -193,6 +200,12 @@ def edit_connection_config(profile: dict) -> dict:
         "Controller URL",
         value=_resolve_value("DSIMAGING_CONTROLLER_URL", profile, "controller_url", ""),
     )
+    controller_token = st.sidebar.text_input(
+        "Controller operator token",
+        value=_resolve_value(
+            "DSIMAGING_CONTROLLER_TOKEN", profile, "controller_token", ""),
+        type="password",
+    )
     sqs_queue_url = st.sidebar.text_input(
         "SQS queue URL",
         value=_nested_value(profile, "aws", "sqs_queue_url")
@@ -200,7 +213,8 @@ def edit_connection_config(profile: dict) -> dict:
     )
     st.sidebar.markdown(
         f"Access key: **{_secret_badge(access_key)}**  \n"
-        f"Secret key: **{_secret_badge(secret_key)}**"
+        f"Secret key: **{_secret_badge(secret_key)}**  \n"
+        f"Controller token: **{_secret_badge(controller_token)}**"
     )
     resolved_backend, rationale = detect_backend(endpoint, backend)
     return {
@@ -213,6 +227,7 @@ def edit_connection_config(profile: dict) -> dict:
         "resolved_backend": resolved_backend,
         "backend_rationale": rationale,
         "controller_url": controller_url,
+        "controller_token": controller_token,
         "sqs_queue_url": sqs_queue_url,
     }
 
@@ -368,7 +383,10 @@ def render_dataset_detail(s3, bucket: str, dataset_id: str, config: dict) -> Non
     )
     objects = list_objects(s3, bucket, f"{prefix}/")
     last_modified = max((obj["last_modified"] for obj in objects), default="not available")
-    controller_seen = controller_dataset_metric(config.get("controller_url"), dataset_id)
+    controller_seen = controller_dataset_metric(
+        config.get("controller_url"), dataset_id,
+        token=config.get("controller_token"),
+    )
     st.metric("Total objects", len(objects))
     st.metric("Total bytes", human_bytes(sum(obj["size"] for obj in objects)))
     st.write(f"Last object change: {last_modified}")
@@ -379,7 +397,15 @@ def render_publish(config: dict) -> None:
     st.header("Publish")
     dataset_id = st.text_input("Dataset ID", key="publish-dataset")
     source_path = st.text_input("Source path", key="publish-source")
-    metadata_path = st.text_input("Metadata path", key="publish-metadata")
+    metadata_path = st.text_input(
+        "Metadata path (required)", key="publish-metadata")
+    privacy_unit_column = st.text_input(
+        "Patient privacy-unit column", key="publish-privacy-unit-column"
+    )
+    label_column = st.text_input(
+        "Label column (optional)", key="publish-label-column"
+    )
+    replace = st.checkbox("Replace an existing dataset atomically", value=False)
     modality = st.selectbox("Modality", ["ct", "mri", "pet", "xray", "unknown"], index=0)
     resource_endpoint = st.text_input("Resource endpoint override", value=config["endpoint"])
     if resource_endpoint:
@@ -392,7 +418,11 @@ def render_publish(config: dict) -> None:
         log: list[str] = []
         with st.expander("Per-object log", expanded=True):
             try:
-                publish_dataset(config, dataset_id, source_path, metadata_path, modality, progress, log.append)
+                publish_dataset(
+                    config, dataset_id, source_path, metadata_path,
+                    privacy_unit_column, label_column or None, modality,
+                    replace, progress, log.append,
+                )
                 st.success("Publish complete.")
             except Exception as exc:
                 st.error(str(exc))
@@ -481,7 +511,10 @@ def render_controller(config: dict) -> None:
         selected = st.selectbox("Dataset to reconcile", datasets)
         if st.button("Reconcile dataset"):
             try:
-                st.json(controller_api.reconcile(controller_url, selected))
+                st.json(controller_api.reconcile(
+                    controller_url, selected,
+                    token=config.get("controller_token"),
+                ))
             except Exception as exc:
                 st.error(str(exc))
     st.subheader("Recent events")
@@ -581,33 +614,64 @@ def preview_modify(images_path: str, masks_path: str) -> dict:
 
 
 def publish_dataset(config: dict, dataset_id: str, source_path: str, metadata_path: str,
-                    modality: str, progress, log: Callable[[str], None]) -> None:
+                    privacy_unit_column: str, label_column: str | None,
+                    modality: str, replace: bool, progress,
+                    log: Callable[[str], None]) -> None:
     validate_dataset_id(dataset_id)
     s3 = make_s3_client(config)
     bucket = config["bucket"]
     prefix = f"datasets/{dataset_id}"
+    if list_objects(s3, bucket, f"{prefix}/") and not replace:
+        raise ValueError(
+            "dataset already exists; select explicit atomic replacement"
+        )
     samples = scan_images(source_path)
     if not samples:
         raise ValueError("No image files found.")
     masks = scan_masks(source_path, sample_ids=[sample["sample_id"] for sample in samples])
     extra_metadata = read_metadata_table(metadata_path) if metadata_path else None
-    sample_uploads, sample_skips = _partition_uploads(s3, bucket, prefix, samples, "images", True)
-    mask_uploads, mask_skips = _partition_uploads(s3, bucket, prefix, masks, "masks", True)
+    build_samples_metadata(
+        samples, extra_metadata=extra_metadata,
+        privacy_unit_col=privacy_unit_column, label_col=label_column,
+    )
+    sample_uploads, sample_skips = _partition_uploads(
+        s3, bucket, prefix, samples, "images", not replace
+    )
+    mask_uploads, mask_skips = _partition_uploads(
+        s3, bucket, prefix, masks, "masks", not replace
+    )
     log(f"Images to upload: {len(sample_uploads)}; skipped: {len(sample_skips)}")
     log(f"Masks to upload: {len(mask_uploads)}; skipped: {len(mask_skips)}")
-    total = max(len(sample_uploads) + len(mask_uploads), 1)
-    done = 0
-    for sample in sample_uploads:
-        _upload_sample(s3, bucket, prefix, sample, "images")
-        done += 1
-        progress.progress(done / total)
-        log(f"uploaded image {sample['sample_id']}")
-    for mask in mask_uploads:
-        _upload_sample(s3, bucket, prefix, mask, "masks")
-        done += 1
-        progress.progress(done / total)
-        log(f"uploaded mask {mask['sample_id']}:{mask['primary_filename']}")
-    _write_dataset_artifacts(s3, bucket, prefix, dataset_id, modality, samples, masks, extra_metadata)
+    transaction = _atomic_upload_sources(
+        s3, bucket, prefix, sample_uploads, mask_uploads, replace=replace,
+        require_empty=not replace,
+    )
+    try:
+        transaction["mutated"] = True
+        published_objects = list_objects(
+            s3, bucket, f"{prefix}/source/images/")
+        published_mask_objects = list_objects(
+            s3, bucket, f"{prefix}/source/masks/")
+        published_samples = scan_s3_images(
+            s3, bucket, prefix, published_objects)
+        published_masks = scan_s3_masks(
+            s3, bucket, prefix, published_mask_objects,
+            sample_ids=[sample["sample_id"] for sample in published_samples],
+        )
+        _write_dataset_artifacts(
+            s3, bucket, prefix, dataset_id, modality,
+            published_samples, published_masks,
+            extra_metadata, privacy_unit_col=privacy_unit_column,
+            label_col=label_column,
+            publish_lock=transaction["publish_lock"],
+        )
+    except Exception:
+        _finish_atomic_publish(s3, bucket, prefix, transaction, commit=False)
+        raise
+    else:
+        if not _finish_atomic_publish(
+                s3, bucket, prefix, transaction, commit=True):
+            raise RuntimeError("dataset publication lock ownership was lost")
     progress.progress(1.0)
     log("manifest and indexes uploaded")
 
@@ -619,18 +683,45 @@ def modify_dataset(config: dict, dataset_id: str, metadata_path: str,
     s3 = make_s3_client(config)
     bucket = config["bucket"]
     prefix = f"datasets/{dataset_id}"
+    manifest = _read_manifest_strict(s3, bucket, prefix)
+    metadata_contract_from_manifest(manifest)
+    image_uploads = scan_images(images_path) if images_path else []
+    existing = list_objects(s3, bucket, f"{prefix}/source/images/")
+    existing_sample_ids = [
+        sample["sample_id"]
+        for sample in scan_s3_images(s3, bucket, prefix, existing)
+    ]
+    masks = scan_masks(
+        masks_path,
+        sample_ids=existing_sample_ids + [
+            sample["sample_id"] for sample in image_uploads
+        ],
+    ) if masks_path else []
+    extra_metadata = (
+        read_metadata_table(metadata_path) if metadata_path
+        else _read_existing_samples_metadata(s3, bucket, prefix)
+    )
+    transaction = _atomic_upload_sources(
+        s3, bucket, prefix, image_uploads, masks, replace=False)
+    try:
+        transaction["mutated"] = True
+        counts = _rescan_dataset_artifacts(
+            s3, bucket, dataset_id, extra_metadata=extra_metadata,
+            publish_lock=transaction["publish_lock"],
+        )
+    except Exception:
+        _finish_atomic_publish(s3, bucket, prefix, transaction, commit=False)
+        raise
+    else:
+        if not _finish_atomic_publish(
+                s3, bucket, prefix, transaction, commit=True):
+            raise RuntimeError("dataset publication lock ownership was lost")
     if images_path:
-        for sample in scan_images(images_path):
-            _upload_sample(s3, bucket, prefix, sample, "images")
+        for sample in image_uploads:
             log(f"uploaded image {sample['sample_id']}")
     if masks_path:
-        existing = list_objects(s3, bucket, f"{prefix}/source/images/")
-        sample_ids = [sample["sample_id"] for sample in scan_s3_images(s3, bucket, prefix, existing)]
-        for mask in scan_masks(masks_path, sample_ids=sample_ids):
-            _upload_sample(s3, bucket, prefix, mask, "masks")
+        for mask in masks:
             log(f"uploaded mask {mask['sample_id']}:{mask['primary_filename']}")
-    extra_metadata = read_metadata_table(metadata_path) if metadata_path else _read_existing_samples_metadata(s3, bucket, prefix)
-    counts = rescan_dataset(config, dataset_id, extra_metadata=extra_metadata)
     log(f"rescan complete: {counts['samples']} samples, {counts['masks']} masks")
 
 
@@ -639,18 +730,22 @@ def rescan_dataset(config: dict, dataset_id: str, extra_metadata=None) -> dict:
     s3 = make_s3_client(config)
     bucket = config["bucket"]
     prefix = f"datasets/{dataset_id}"
-    objects = list_objects(s3, bucket, f"{prefix}/source/images/")
-    masks_objects = list_objects(s3, bucket, f"{prefix}/source/masks/")
-    samples = scan_s3_images(s3, bucket, prefix, objects)
-    if not samples:
-        raise ValueError("No supported image objects found.")
-    masks = scan_s3_masks(s3, bucket, prefix, masks_objects,
-                          sample_ids=[sample["sample_id"] for sample in samples])
-    if extra_metadata is None:
-        extra_metadata = _read_existing_samples_metadata(s3, bucket, prefix)
-    modality = manifest_modality(s3, bucket, prefix)
-    _write_dataset_artifacts(s3, bucket, prefix, dataset_id, modality, samples, masks, extra_metadata)
-    return {"samples": len(samples), "masks": len(masks)}
+    transaction = _atomic_upload_sources(
+        s3, bucket, prefix, [], [], replace=False)
+    try:
+        transaction["mutated"] = True
+        counts = _rescan_dataset_artifacts(
+            s3, bucket, dataset_id, extra_metadata=extra_metadata,
+            publish_lock=transaction["publish_lock"],
+        )
+    except Exception:
+        _finish_atomic_publish(s3, bucket, prefix, transaction, commit=False)
+        raise
+    else:
+        if not _finish_atomic_publish(
+                s3, bucket, prefix, transaction, commit=True):
+            raise RuntimeError("dataset publication lock ownership was lost")
+    return {"samples": counts["samples"], "masks": counts["masks"]}
 
 
 def init_aws_store(config: dict, kms_key: str) -> None:
@@ -780,13 +875,14 @@ def resource_block(config: dict, dataset_id: str) -> str:
     }, sort_keys=False)
 
 
-def controller_dataset_metric(controller_url: str | None, dataset_id: str) -> str | None:
+def controller_dataset_metric(controller_url: str | None, dataset_id: str, *,
+                              token: str | None = None) -> str | None:
     if not controller_url:
         return None
     try:
-        for item in controller_api.datasets(controller_url):
+        for item in controller_api.datasets(controller_url, token=token):
             if item.get("dataset_id") == dataset_id:
-                return item.get("last_reconcile")
+                return item.get("last_reconcile_at")
     except Exception:
         return None
     return None

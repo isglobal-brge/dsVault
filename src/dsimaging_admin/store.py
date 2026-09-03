@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import shutil
 import subprocess
 from dataclasses import dataclass, asdict
@@ -22,6 +23,7 @@ class StoreConfig:
     path: str
     endpoint: str
     controller_url: str
+    controller_token: str
     bucket: str
     access_key: str
     secret_key: str
@@ -32,6 +34,7 @@ class StoreConfig:
     def to_dict(self) -> dict:
         data = asdict(self)
         data.pop("secret_key", None)
+        data.pop("controller_token", None)
         return data
 
 
@@ -50,6 +53,7 @@ def init_store(
     console_port: int = 9001,
     controller_port: int = 8080,
     reconcile_interval: int = 10,
+    controller_token: str | None = None,
 ) -> StoreConfig:
     """Create a dsimaging-store Compose project directory."""
     root = Path(dest).expanduser().resolve()
@@ -61,13 +65,17 @@ def init_store(
         raise FileExistsError(f"{root} already contains generated store files: {names}")
 
     controller_block = _controller_compose_block(controller_image, store_source)
+    controller_token = controller_token or secrets.token_urlsafe(32)
     compose = COMPOSE_TEMPLATE.format(
         minio_image=minio_image,
         mc_image=mc_image,
         controller_block=controller_block.rstrip(),
     )
     (root / "docker-compose.yml").write_text(compose, encoding="utf-8")
-    (root / ".env").write_text(ENV_TEMPLATE.format(
+    env_path = root / ".env"
+    env_path.touch(mode=0o600, exist_ok=True)
+    env_path.chmod(0o600)
+    env_path.write_text(ENV_TEMPLATE.format(
         access_key=access_key,
         secret_key=secret_key,
         minio_port=minio_port,
@@ -75,6 +83,7 @@ def init_store(
         controller_port=controller_port,
         bucket=bucket,
         reconcile_interval=reconcile_interval,
+        controller_token=controller_token,
         controller_image=controller_image,
         minio_image=minio_image,
         mc_image=mc_image,
@@ -94,6 +103,7 @@ def load_store_config(path: str) -> StoreConfig:
         path=str(root),
         endpoint=f"http://127.0.0.1:{minio_port}",
         controller_url=f"http://127.0.0.1:{controller_port}",
+        controller_token=env.get("DSIMAGING_CONTROLLER_TOKEN", ""),
         bucket=env.get("BUCKET_NAME", "imaging-data"),
         access_key=env.get("MINIO_ROOT_USER", "minioadmin"),
         secret_key=env.get("MINIO_ROOT_PASSWORD", "minioadmin123"),
@@ -233,13 +243,15 @@ services:
   controller:
 {controller_block}
     ports:
-      - "${{CONTROLLER_PORT:-8080}}:8080"
+      - "127.0.0.1:${{CONTROLLER_PORT:-8080}}:8080"
     environment:
       MINIO_ENDPOINT: http://minio:9000
       MINIO_ROOT_USER: ${{MINIO_ROOT_USER:-minioadmin}}
       MINIO_ROOT_PASSWORD: ${{MINIO_ROOT_PASSWORD:-minioadmin123}}
       BUCKET_NAME: ${{BUCKET_NAME:-imaging-data}}
       RECONCILE_INTERVAL_SECONDS: ${{RECONCILE_INTERVAL_SECONDS:-10}}
+      DSIMAGING_CONTROLLER_TOKEN: ${{DSIMAGING_CONTROLLER_TOKEN:-}}
+      DSIMAGING_MAX_WEBHOOK_BODY_BYTES: ${{DSIMAGING_MAX_WEBHOOK_BODY_BYTES:-1048576}}
     depends_on:
       minio:
         condition: service_healthy
@@ -275,6 +287,8 @@ MINIO_CONSOLE_PORT={console_port}
 CONTROLLER_PORT={controller_port}
 BUCKET_NAME={bucket}
 RECONCILE_INTERVAL_SECONDS={reconcile_interval}
+DSIMAGING_MAX_WEBHOOK_BODY_BYTES=1048576
+DSIMAGING_CONTROLLER_TOKEN={controller_token}
 WEBHOOK_RETRIES=12
 WEBHOOK_RETRY_SECONDS=5
 DSIMAGING_STORE_CONTROLLER_IMAGE={controller_image}

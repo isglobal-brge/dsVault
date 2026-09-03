@@ -7,6 +7,7 @@ import json
 import os
 import re
 import time
+from copy import deepcopy
 
 import pyarrow as pa
 import pyarrow.csv as pacsv
@@ -16,11 +17,17 @@ import yaml
 from .hashing import sha256_file, is_image_file, sample_id_from_filename
 
 DATASET_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+ID_COL = "sample_id"
+PRIVACY_UNIT = "patient"
+PRIVACY_UNIT_CANONICALIZATION = "trim-utf8-v2"
+_ASCII_ID_TRIM = " \t\r\n"
+_MAX_PRIVACY_UNIT_BYTES = 4096
+_MISSING_VALUES = {"na", "nan", "null", "<na>", "nat"}
 
 
 def validate_dataset_id(dataset_id: str) -> str:
     """Validate and return a dsimaging dataset identifier."""
-    if not DATASET_ID_RE.match(dataset_id or ""):
+    if not DATASET_ID_RE.fullmatch(dataset_id or ""):
         raise ValueError(
             "dataset_id must match ^[a-z0-9][a-z0-9._-]*$ "
             "(lowercase letters, digits, dot, underscore and dash)"
@@ -75,6 +82,7 @@ def scan_images(source_dir: str) -> list[dict]:
                     "local_path": filepath,
                 })
 
+    _validate_sample_ids(samples)
     return samples
 
 
@@ -162,7 +170,9 @@ def scan_masks(source_dir: str, sample_ids: list[str] | None = None) -> list[dic
                 "local_path": filepath,
             })
 
-    return sorted(masks, key=lambda sample: sample["sample_id"])
+    masks = sorted(masks, key=lambda sample: sample["sample_id"])
+    _validate_mask_ids(masks, sample_ids)
+    return masks
 
 
 def scan_s3_images(s3, bucket: str, prefix: str, objects: list[dict]) -> list[dict]:
@@ -237,7 +247,9 @@ def scan_s3_images(s3, bucket: str, prefix: str, objects: list[dict]) -> list[di
             "etag": ",".join(etags) if etags else None,
         })
 
-    return sorted(samples, key=lambda sample: sample["sample_id"])
+    samples = sorted(samples, key=lambda sample: sample["sample_id"])
+    _validate_sample_ids(samples)
+    return samples
 
 
 def scan_s3_masks(s3, bucket: str, prefix: str, objects: list[dict],
@@ -270,28 +282,25 @@ def scan_s3_masks(s3, bucket: str, prefix: str, objects: list[dict],
             "etag": obj.get("etag"),
         })
 
-    return sorted(masks, key=lambda sample: sample["sample_id"])
+    masks = sorted(masks, key=lambda sample: sample["sample_id"])
+    _validate_mask_ids(masks, sample_ids)
+    return masks
 
 
 def generate_manifest(dataset_id: str, bucket: str, prefix: str,
                       modality: str = "unknown", has_masks: bool = False,
-                      mask_asset: str = "masks") -> dict:
+                      mask_asset: str = "masks", *,
+                      privacy_unit_col: str,
+                      label_col: str | None = None,
+                      existing_manifest: dict | None = None) -> dict:
     """Generate a manifest dict for a dataset."""
     validate_dataset_id(dataset_id)
-    manifest = {
-        "schema_version": 1,
+    contract = metadata_contract(privacy_unit_col, label_col)
+    manifest = deepcopy(existing_manifest) if existing_manifest is not None else {}
+    manifest.update({
+        "schema_version": manifest.get("schema_version", 1),
         "dataset_id": dataset_id,
         "modality": modality,
-        "assets": {
-            "images": {
-                "uri": f"s3://{bucket}/{prefix}/source/images/",
-                "kind": "image_root",
-            },
-        },
-        "metadata": {
-            "uri": f"s3://{bucket}/{prefix}/metadata/samples.parquet",
-            "format": "parquet",
-        },
         "content_hash_index": {
             "uri": f"s3://{bucket}/{prefix}/indexes/content_hash_index.parquet",
             "format": "parquet",
@@ -300,9 +309,24 @@ def generate_manifest(dataset_id: str, bucket: str, prefix: str,
             "uri": f"s3://{bucket}/{prefix}/metadata/sample_manifests.parquet",
             "format": "parquet",
         },
+    })
+    assets = deepcopy(manifest.get("assets")) if isinstance(manifest.get("assets"), dict) else {}
+    assets["images"] = {
+        "uri": f"s3://{bucket}/{prefix}/source/images/",
+        "kind": "image_root",
     }
+    metadata = deepcopy(manifest.get("metadata")) if isinstance(manifest.get("metadata"), dict) else {}
+    metadata.update({
+        "uri": f"s3://{bucket}/{prefix}/metadata/samples.parquet",
+        "format": "parquet",
+        **contract,
+    })
+    if label_col is None:
+        metadata.pop("label_col", None)
+    manifest["assets"] = assets
+    manifest["metadata"] = metadata
     if has_masks:
-        manifest["assets"][mask_asset] = {
+        assets[mask_asset] = {
             "uri": f"s3://{bucket}/{prefix}/source/masks/",
             "kind": "mask_root",
             "content_hash_index": (
@@ -310,7 +334,54 @@ def generate_manifest(dataset_id: str, bucket: str, prefix: str,
                 f"{mask_asset}_content_hash_index.parquet"
             ),
         }
+    else:
+        assets.pop(mask_asset, None)
     return manifest
+
+
+def metadata_contract(privacy_unit_col: str,
+                      label_col: str | None = None) -> dict:
+    """Return the pinned disclosure-control contract for sample metadata."""
+    privacy_unit_col = _validate_column_name(privacy_unit_col, "privacy_unit_col")
+    if (privacy_unit_col == ID_COL or
+            privacy_unit_col.lower() in {"source_kind", "n_files"}):
+        raise ValueError(
+            "privacy_unit_col must identify a dedicated patient column"
+        )
+    contract = {
+        "id_col": ID_COL,
+        "privacy_unit": PRIVACY_UNIT,
+        "privacy_unit_col": privacy_unit_col,
+        "privacy_unit_canonicalization": PRIVACY_UNIT_CANONICALIZATION,
+    }
+    if label_col is not None:
+        label_col = _validate_column_name(label_col, "label_col")
+        if label_col in {ID_COL, "source_kind", "n_files", privacy_unit_col}:
+            raise ValueError(
+                "label_col must be distinct from sample and patient columns"
+            )
+        contract["label_col"] = label_col
+    return contract
+
+
+def metadata_contract_from_manifest(manifest: dict) -> dict:
+    """Read and validate a manifest's pinned metadata privacy contract."""
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be a mapping")
+    metadata = manifest.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError("manifest metadata must be a mapping")
+    if metadata.get("id_col") != ID_COL:
+        raise ValueError("manifest metadata.id_col must be 'sample_id'")
+    if metadata.get("privacy_unit") != PRIVACY_UNIT:
+        raise ValueError("manifest metadata.privacy_unit must be 'patient'")
+    if metadata.get("privacy_unit_canonicalization") != PRIVACY_UNIT_CANONICALIZATION:
+        raise ValueError(
+            "manifest metadata.privacy_unit_canonicalization must be 'trim-utf8-v2'"
+        )
+    return metadata_contract(
+        metadata.get("privacy_unit_col"), metadata.get("label_col")
+    )
 
 
 def write_manifest_yaml(manifest: dict, path: str):
@@ -367,7 +438,13 @@ def build_sample_manifests(samples: list[dict]) -> pa.Table:
         "sample_id": [s["sample_id"] for s in samples],
         "source_kind": [s["source_kind"] for s in samples],
         "primary_uri": pa.array(
-            [s["primary_filename"] for s in samples], type=pa.string()
+            [
+                (s.get("uri_path") or s["primary_filename"])
+                if s["source_kind"] == "single_file"
+                else s["primary_filename"]
+                for s in samples
+            ],
+            type=pa.string(),
         ),
         "files_json": [json.dumps(s["files"]) for s in samples],
         "content_hash": [s["content_hash"] for s in samples],
@@ -376,14 +453,11 @@ def build_sample_manifests(samples: list[dict]) -> pa.Table:
 
 
 def build_samples_metadata(samples: list[dict],
-                           extra_metadata: pa.Table | None = None) -> pa.Table:
-    """Build sample metadata, optionally left-joining user metadata.
-
-    ``extra_metadata`` must contain a unique ``sample_id`` column. Extra rows
-    that do not correspond to discovered images are ignored; missing rows for
-    image samples become nulls. This keeps the manifest image-led while allowing
-    clinical/outcome variables to travel with the dataset.
-    """
+                           extra_metadata: pa.Table | None = None, *,
+                           privacy_unit_col: str | None = None,
+                           label_col: str | None = None) -> pa.Table:
+    """Build sample metadata from an exact image/metadata sample roster."""
+    _validate_sample_ids(samples)
     if not samples:
         base = pa.table({
             "sample_id": pa.array([], type=pa.string()),
@@ -391,16 +465,51 @@ def build_samples_metadata(samples: list[dict],
             "n_files": pa.array([], type=pa.int32()),
         })
         if extra_metadata is None:
-            return base
-        return _left_join_metadata(base, extra_metadata)
+            result = base
+        else:
+            result = _left_join_metadata(base, extra_metadata)
+        return validate_samples_metadata(
+            result, privacy_unit_col, label_col
+        ) if privacy_unit_col is not None else result
     base = pa.table({
         "sample_id": [s["sample_id"] for s in samples],
         "source_kind": [s["source_kind"] for s in samples],
         "n_files": pa.array([len(s["files"]) for s in samples], type=pa.int32()),
     })
-    if extra_metadata is None:
-        return base
-    return _left_join_metadata(base, extra_metadata)
+    result = base if extra_metadata is None else _left_join_metadata(base, extra_metadata)
+    return validate_samples_metadata(
+        result, privacy_unit_col, label_col
+    ) if privacy_unit_col is not None else result
+
+
+def validate_samples_metadata(table: pa.Table, privacy_unit_col: str,
+                              label_col: str | None = None) -> pa.Table:
+    """Fail closed unless every sample has its pinned patient unit and label."""
+    contract = metadata_contract(privacy_unit_col, label_col)
+    table = _normalise_metadata_table(table)
+    ids = table[ID_COL].to_pylist()
+    _validate_values(ids, ID_COL, canonical_patient_ids=False)
+    _require_canonical_sample_ids(ids)
+    duplicates = _duplicates(ids)
+    if duplicates:
+        raise ValueError(f"metadata has duplicate sample_id: {duplicates[0]}")
+    for key in ("privacy_unit_col", "label_col"):
+        column = contract.get(key)
+        if column is None:
+            continue
+        if column not in table.column_names:
+            raise ValueError(f"metadata must contain declared {key} column: {column}")
+        _validate_values(
+            table[column].to_pylist(), column,
+            canonical_patient_ids=(key == "privacy_unit_col"),
+        )
+        if key == "privacy_unit_col":
+            values = [_canonical_identifier(value)
+                      for value in table[column].to_pylist()]
+            index = table.column_names.index(column)
+            table = table.set_column(
+                index, column, pa.array(values, type=pa.string()))
+    return table
 
 
 def read_metadata_table(path: str) -> pa.Table:
@@ -422,8 +531,89 @@ def _normalise_metadata_table(table: pa.Table) -> pa.Table:
     return table.set_column(idx, "sample_id", table["sample_id"].cast(pa.string()))
 
 
+def _validate_column_name(value, field: str) -> str:
+    if not isinstance(value, str) or not value.strip(_ASCII_ID_TRIM):
+        raise ValueError(f"{field} must be a non-empty column name")
+    return value.strip(_ASCII_ID_TRIM)
+
+
+def _canonical_identifier(value) -> str:
+    """Apply the shared trim-utf8-v2 identifier contract."""
+    return str(value).strip(_ASCII_ID_TRIM)
+
+
+def _require_canonical_sample_ids(values: list) -> None:
+    """Reject sample IDs whose canonical form would change asset linkage."""
+    for row_number, value in enumerate(values, start=1):
+        canonical = _canonical_identifier(value)
+        if str(value) != canonical:
+            raise ValueError(
+                "metadata sample_id must already satisfy trim-utf8-v2 "
+                f"at row {row_number}"
+            )
+        if len(canonical.encode("utf-8", errors="strict")) > _MAX_PRIVACY_UNIT_BYTES:
+            raise ValueError(
+                f"metadata sample_id exceeds 4096 UTF-8 bytes at row {row_number}"
+            )
+
+
+def _validate_values(values: list, column: str, *,
+                     canonical_patient_ids: bool) -> None:
+    for row_number, value in enumerate(values, start=1):
+        if value is None:
+            raise ValueError(f"metadata column {column} is empty at row {row_number}")
+        try:
+            text = str(value).strip(_ASCII_ID_TRIM)
+            encoded = text.encode("utf-8", errors="strict")
+        except (TypeError, UnicodeError, ValueError) as exc:
+            raise ValueError(
+                f"metadata column {column} is invalid at row {row_number}"
+            ) from exc
+        if not text or text.lower() in _MISSING_VALUES:
+            raise ValueError(f"metadata column {column} is empty at row {row_number}")
+        if canonical_patient_ids and len(encoded) > _MAX_PRIVACY_UNIT_BYTES:
+            raise ValueError(
+                f"metadata column {column} exceeds 4096 UTF-8 bytes at row {row_number}"
+            )
+
+
+def _validate_sample_ids(samples: list[dict]) -> None:
+    ids = [sample.get(ID_COL) for sample in samples]
+    _validate_values(ids, ID_COL, canonical_patient_ids=False)
+    _require_canonical_sample_ids(ids)
+    duplicates = _duplicates(ids)
+    if duplicates:
+        raise ValueError(f"duplicate sample_id discovered: {duplicates[0]}")
+
+
+def _validate_mask_ids(masks: list[dict], sample_ids: list[str] | None) -> None:
+    """Require a one-to-zero/one mapping from admitted samples to masks."""
+    _validate_sample_ids(masks)
+    if sample_ids is None:
+        return
+    allowed = set(sample_ids)
+    orphan = next(
+        (mask[ID_COL] for mask in masks if mask[ID_COL] not in allowed), None)
+    if orphan is not None:
+        raise ValueError(f"mask has no matching image sample_id: {orphan}")
+
+
+def _duplicates(values: list) -> list:
+    seen = set()
+    duplicates = []
+    for value in values:
+        if value in seen and value not in duplicates:
+            duplicates.append(value)
+        seen.add(value)
+    return duplicates
+
+
 def _left_join_metadata(base: pa.Table, extra_metadata: pa.Table) -> pa.Table:
     extra_metadata = _normalise_metadata_table(extra_metadata)
+    _validate_values(
+        extra_metadata[ID_COL].to_pylist(), ID_COL,
+        canonical_patient_ids=False)
+    _require_canonical_sample_ids(extra_metadata[ID_COL].to_pylist())
     base_ids = base["sample_id"].to_pylist()
     rows_by_id: dict[str, dict] = {}
     for row in extra_metadata.to_pylist():
@@ -431,6 +621,13 @@ def _left_join_metadata(base: pa.Table, extra_metadata: pa.Table) -> pa.Table:
         if sample_id in rows_by_id:
             raise ValueError(f"metadata has duplicate sample_id: {sample_id}")
         rows_by_id[sample_id] = row
+
+    base_set = set(base_ids)
+    metadata_set = set(rows_by_id)
+    if base_set != metadata_set:
+        raise ValueError(
+            "metadata sample_id roster must exactly match discovered images"
+        )
 
     extra_columns = [
         name for name in extra_metadata.column_names
