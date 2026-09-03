@@ -86,8 +86,6 @@ def _load_config(profile: str | None = None) -> dict:
 
 
 def _write_config_profile(profile: str, values: dict, set_default: bool = True) -> None:
-    import yaml
-
     data = _load_all_config()
     if "profiles" not in data:
         existing = data.get("default", data) if data else {}
@@ -97,9 +95,32 @@ def _write_config_profile(profile: str, values: dict, set_default: bool = True) 
     data.setdefault("profiles", {})[profile] = values
     if set_default:
         data["default_profile"] = profile
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
-    os.chmod(CONFIG_PATH, 0o600)
+    _write_config(data)
+
+
+def _write_config(data: dict) -> None:
+    import yaml
+
+    config_path = Path(CONFIG_PATH)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{config_path.name}.", dir=config_path.parent, text=True)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, config_path)
+        os.chmod(config_path, 0o600)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 def _resolve(cli_value: str | None, envvar: str, cfg: dict,
@@ -161,10 +182,7 @@ def _persist_aws_queue_url(profile: str, queue_url: str, bucket: str | None = No
     if endpoint:
         target["endpoint"] = endpoint
     target.setdefault("aws", {})["sqs_queue_url"] = queue_url
-    import yaml
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
-    os.chmod(CONFIG_PATH, 0o600)
+    _write_config(data)
 
 
 def _echo_json(payload: dict | list) -> None:
@@ -332,11 +350,10 @@ def ui_group(ctx, host, port, open_browser):
               help="Ask Streamlit to open a browser window")
 def ui_launch(host, port, open_browser):
     """Open the Streamlit operator dashboard."""
-    if host not in ("127.0.0.1", "localhost"):
-        click.echo(
-            "WARNING: dsimaging-admin ui is an unauthenticated local operator tool; "
-            f"binding to {host} may expose storage administration controls.",
-            err=True,
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        raise click.ClickException(
+            "The unauthenticated operator dashboard may only bind to loopback. "
+            "Use an SSH tunnel for remote administration."
         )
     try:
         from .ui import launch_ui
@@ -532,18 +549,19 @@ def store_doctor_cmd(path, output):
               help="Metadata column containing the patient privacy unit")
 @click.option("--label-column", default=None,
               help="Optional complete metadata label/outcome column")
+@click.option("--public-label-level", "label_levels", multiple=True,
+              help="Approved public label value; repeat for each releasable level")
 @click.option("--modality", default="unknown", help="Imaging modality (ct, mri, etc.)")
 @click.option("--replace", is_flag=True,
               help="Explicitly replace an existing dataset (atomic mode only)")
 @click.option("--atomic/--no-atomic", default=True,
               help="Publish through a staging prefix and publish lock")
-@click.option("--no-skip", is_flag=True,
-              help="Upload objects even when the current dataset index already matches")
 @click.option("--dry-run", is_flag=True, help="Scan and plan without S3 writes")
 @click.option("--skip-dicom-checks", is_flag=True, help="Skip pre-publish DICOM sanity checks")
 @click.pass_context
 def publish(ctx, dataset_id, source, metadata, privacy_unit_column, label_column,
-            modality, replace, atomic, no_skip, dry_run, skip_dicom_checks):
+            label_levels, modality, replace, atomic, dry_run,
+            skip_dicom_checks):
     """Publish a local dataset to S3/MinIO."""
     if not atomic:
         raise click.ClickException(
@@ -594,22 +612,17 @@ def publish(ctx, dataset_id, source, metadata, privacy_unit_column, label_column
         build_samples_metadata(
             samples, extra_metadata=extra_metadata,
             privacy_unit_col=privacy_unit_column, label_col=label_column,
+            label_levels=label_levels,
         )
     except ValueError as e:
         raise click.ClickException(str(e)) from e
 
-    # Replacement must stage every desired source object; otherwise a matching
-    # object skipped from staging could be mistaken for stale historical data.
-    skip_enabled = not no_skip and not replace
-    sample_uploads, sample_skips = _partition_uploads(s3, bucket, prefix, samples,
-                                                      source_path="images",
-                                                      enabled=skip_enabled)
-    mask_uploads, mask_skips = _partition_uploads(s3, bucket, prefix, masks,
-                                                  source_path="masks",
-                                                  enabled=skip_enabled)
-
-    click.echo(f"  Images to upload: {len(sample_uploads)}; skipped: {len(sample_skips)}")
-    click.echo(f"  Masks to upload:  {len(mask_uploads)}; skipped: {len(mask_skips)}")
+    # New publications have no prior index, while replacements must stage the
+    # complete source set so stale historical objects can be removed safely.
+    sample_uploads = samples
+    mask_uploads = masks
+    click.echo(f"  Images to upload: {len(sample_uploads)}")
+    click.echo(f"  Masks to upload:  {len(mask_uploads)}")
     if dry_run:
         click.echo(click.style("Dry run complete; no S3 writes performed.", fg="green"))
         return
@@ -626,9 +639,9 @@ def publish(ctx, dataset_id, source, metadata, privacy_unit_column, label_column
 
         transaction["mutated"] = True
         published_objects = list_objects(
-            s3, bucket, f"{prefix}/source/images/")
+            s3, bucket, f"{prefix}/source/images/", include_version_ids=True)
         published_mask_objects = list_objects(
-            s3, bucket, f"{prefix}/source/masks/")
+            s3, bucket, f"{prefix}/source/masks/", include_version_ids=True)
         published_samples = scan_s3_images(
             s3, bucket, prefix, published_objects)
         published_masks = scan_s3_masks(
@@ -639,6 +652,7 @@ def publish(ctx, dataset_id, source, metadata, privacy_unit_column, label_column
             s3, bucket, prefix, dataset_id, modality, published_samples,
             masks=published_masks, extra_metadata=extra_metadata,
             privacy_unit_col=privacy_unit_column, label_col=label_column,
+            label_levels=label_levels,
             publish_lock=transaction["publish_lock"],
         )
     except Exception:
@@ -755,7 +769,10 @@ def status(ctx, dataset_id, controller_url, skip_controller, output):
 @dataset_group.command("verify")
 @click.argument("dataset_id")
 @click.option("--sample-fraction", default=1.0, show_default=True, type=float)
-@click.option("--quick", is_flag=True, help="Trust unchanged S3 ETags as a quick check")
+@click.option(
+    "--quick", is_flag=True,
+    help="Skip hashing only when the recorded immutable S3 version still matches",
+)
 @click.option("--output", type=click.Choice(["text", "json"]), default="text")
 @click.pass_context
 def verify_cmd(ctx, dataset_id, sample_fraction, quick, output):
@@ -901,8 +918,10 @@ def copy_cmd(ctx, src_id, dst_id, yes, replace):
         if _object_inventory(sources) != _object_inventory(list_objects(
                 s3, bucket, f"{src_prefix}/source/")):
             raise RuntimeError("source dataset changed while it was being copied")
-        objects = list_objects(s3, bucket, f"{dst_prefix}/source/images/")
-        masks_objects = list_objects(s3, bucket, f"{dst_prefix}/source/masks/")
+        objects = list_objects(
+            s3, bucket, f"{dst_prefix}/source/images/", include_version_ids=True)
+        masks_objects = list_objects(
+            s3, bucket, f"{dst_prefix}/source/masks/", include_version_ids=True)
         samples = scan_s3_images(s3, bucket, dst_prefix, objects)
         masks = scan_s3_masks(
             s3, bucket, dst_prefix, masks_objects,
@@ -913,6 +932,7 @@ def copy_cmd(ctx, src_id, dst_id, yes, replace):
             masks=masks, extra_metadata=extra_metadata,
             privacy_unit_col=contract["privacy_unit_col"],
             label_col=contract.get("label_col"),
+            label_levels=contract.get("label_levels"),
             existing_manifest=source_manifest,
             publish_lock=transaction["publish_lock"],
         )
@@ -1154,8 +1174,10 @@ def _rescan_dataset_artifacts(s3, bucket: str, dataset_id: str,
                               extra_metadata=None, *,
                               publish_lock: dict | None = None) -> dict:
     prefix = f"datasets/{dataset_id}"
-    objects = list_objects(s3, bucket, f"{prefix}/source/images/")
-    mask_objects = list_objects(s3, bucket, f"{prefix}/source/masks/")
+    objects = list_objects(
+        s3, bucket, f"{prefix}/source/images/", include_version_ids=True)
+    mask_objects = list_objects(
+        s3, bucket, f"{prefix}/source/masks/", include_version_ids=True)
     samples = scan_s3_images(s3, bucket, prefix, objects)
     if not samples:
         raise click.ClickException("No supported image objects found.")
@@ -1174,6 +1196,7 @@ def _rescan_dataset_artifacts(s3, bucket: str, dataset_id: str,
         masks=masks, extra_metadata=extra_metadata,
         privacy_unit_col=contract["privacy_unit_col"],
         label_col=contract.get("label_col"),
+        label_levels=contract.get("label_levels"),
         existing_manifest=existing_manifest,
         publish_lock=publish_lock,
     )
@@ -1411,6 +1434,7 @@ def _write_dataset_artifacts(s3, bucket: str, prefix: str, dataset_id: str,
                              extra_metadata=None, *,
                              privacy_unit_col: str,
                              label_col: str | None = None,
+                             label_levels: list[str] | tuple[str, ...] | None = None,
                              existing_manifest: dict | None = None,
                              publish_lock: dict | None = None) -> None:
     import pyarrow.parquet as pq
@@ -1438,6 +1462,7 @@ def _write_dataset_artifacts(s3, bucket: str, prefix: str, dataset_id: str,
         meta = build_samples_metadata(
             samples, extra_metadata=extra_metadata,
             privacy_unit_col=privacy_unit_col, label_col=label_col,
+            label_levels=label_levels,
         )
         meta_path = os.path.join(tmpdir, "samples.parquet")
         pq.write_table(meta, meta_path)
@@ -1446,6 +1471,7 @@ def _write_dataset_artifacts(s3, bucket: str, prefix: str, dataset_id: str,
         manifest = generate_manifest(
             dataset_id, bucket, prefix, modality, has_masks=bool(masks),
             privacy_unit_col=privacy_unit_col, label_col=label_col,
+            label_levels=label_levels,
             existing_manifest=existing_manifest,
         )
         manifest_path = os.path.join(tmpdir, "manifest.yaml")

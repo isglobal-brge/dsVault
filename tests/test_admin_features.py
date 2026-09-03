@@ -22,6 +22,7 @@ from dsimaging_admin.store import (
     DEFAULT_CONTROLLER_IMAGE,
     DEFAULT_MC_IMAGE,
     DEFAULT_MINIO_IMAGE,
+    INIT_BUCKET_SCRIPT,
     init_store,
     load_store_config,
 )
@@ -73,6 +74,7 @@ class FakeS3:
             "ContentLength": len(obj["body"]),
             "LastModified": obj["last_modified"],
             "ETag": f'"{obj.get("etag", "etag")}"',
+            "VersionId": obj.get("version_id"),
         }
 
     def get_paginator(self, name):
@@ -143,12 +145,22 @@ class AdminFeatureTests(unittest.TestCase):
         self.assertNotEqual(cfg.access_key, "minioadmin")
         self.assertNotEqual(cfg.secret_key, "minioadmin123")
         self.assertTrue(cfg.controller_token)
+        self.assertTrue(cfg.webhook_token)
         self.assertEqual(cfg.controller_token, loaded.controller_token)
+        self.assertEqual(cfg.webhook_token, loaded.webhook_token)
         self.assertNotIn("controller_token", cfg.to_dict())
+        self.assertNotIn("webhook_token", cfg.to_dict())
         self.assertEqual(env_mode, 0o600)
         self.assertIn("example/dsimaging-store-controller:test", env)
         self.assertIn("DSIMAGING_CONTROLLER_TOKEN=", env)
         self.assertIn("DSIMAGING_CONTROLLER_TOKEN", compose)
+        self.assertIn("DSIMAGING_WEBHOOK_TOKEN=", env)
+        self.assertIn(
+            'MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_DSIMAGING: '
+            '"Bearer ${DSIMAGING_WEBHOOK_TOKEN:',
+            compose,
+        )
+        self.assertIn("DSIMAGING_WEBHOOK_TOKEN", compose)
         self.assertIn('127.0.0.1:${MINIO_PORT:-9000}:9000', compose)
         self.assertIn(
             '127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001', compose)
@@ -184,6 +196,12 @@ class AdminFeatureTests(unittest.TestCase):
         self.assertEqual(second.access_key, first.access_key)
         self.assertEqual(second.secret_key, first.secret_key)
         self.assertEqual(second.controller_token, first.controller_token)
+        self.assertEqual(second.webhook_token, first.webhook_token)
+
+    def test_store_init_never_places_secret_in_mc_process_arguments(self):
+        self.assertNotIn(
+            'mc alias set local "${MINIO_ENDPOINT}"', INIT_BUCKET_SCRIPT)
+        self.assertIn("| mc alias import local/", INIT_BUCKET_SCRIPT)
 
     def test_store_init_rejects_dotenv_injection_and_invalid_ports(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -316,7 +334,7 @@ class AdminFeatureTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.mismatched, 1)
 
-    def test_verify_quick_accepts_unchanged_etag(self):
+    def test_verify_quick_does_not_trust_etag_or_null_version(self):
         bucket = "imaging-data"
         prefix = "datasets/study_ct_v1"
         sample = {
@@ -327,6 +345,7 @@ class AdminFeatureTests(unittest.TestCase):
             "files": [{"path": "case001.nii.gz", "role": "primary"}],
             "content_hash": hashlib.sha256(b"expected").hexdigest(),
             "size": len(b"actual"),
+            "version_id": "null",
             "etag": "same-etag",
         }
         index = build_hash_index([sample], bucket, prefix)
@@ -335,6 +354,7 @@ class AdminFeatureTests(unittest.TestCase):
             f"{prefix}/source/images/case001.nii.gz": {
                 "body": b"actual",
                 "etag": "same-etag",
+                "version_id": "null",
                 "last_modified": now,
             },
             f"{prefix}/indexes/content_hash_index.parquet": {
@@ -346,6 +366,43 @@ class AdminFeatureTests(unittest.TestCase):
         s3 = FakeS3(objects)
 
         result = verify_dataset(s3, bucket, "study_ct_v1", quick=True)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.mismatched, 1)
+        self.assertEqual(result.quick_ok, 0)
+
+    def test_verify_quick_accepts_matching_immutable_version(self):
+        bucket = "imaging-data"
+        prefix = "datasets/study_ct_v1"
+        payload = b"actual"
+        sample = {
+            "sample_id": "case001",
+            "source_kind": "single_file",
+            "primary_filename": "case001.nii.gz",
+            "uri_path": "case001.nii.gz",
+            "files": [{"path": "case001.nii.gz", "role": "primary"}],
+            "content_hash": hashlib.sha256(b"recorded-at-upload").hexdigest(),
+            "size": len(payload),
+            "version_id": "immutable-version-1",
+            "etag": "same-etag",
+        }
+        now = dt.datetime(2026, 5, 13, tzinfo=dt.timezone.utc)
+        objects = {
+            f"{prefix}/source/images/case001.nii.gz": {
+                "body": payload,
+                "etag": "same-etag",
+                "version_id": "immutable-version-1",
+                "last_modified": now,
+            },
+            f"{prefix}/indexes/content_hash_index.parquet": {
+                "body": parquet_bytes(build_hash_index([sample], bucket, prefix)),
+                "last_modified": now,
+            },
+        }
+        objects.update(publication_artifacts(bucket, prefix, [sample], now))
+
+        result = verify_dataset(
+            FakeS3(objects), bucket, "study_ct_v1", quick=True)
 
         self.assertTrue(result.ok)
         self.assertEqual(result.quick_ok, 1)

@@ -48,6 +48,7 @@ from dsimaging_admin.manifest import (
     scan_s3_images,
     scan_s3_masks,
     validate_dataset_id,
+    validate_dicom_series,
 )
 from dsimaging_admin.s3 import (
     create_client,
@@ -183,13 +184,15 @@ def edit_connection_config(profile: dict) -> dict:
     )
     access_key = st.sidebar.text_input(
         "Access key",
-        value=_resolve_value("DSIMAGING_ACCESS_KEY", profile, "access_key", ""),
+        value="",
         type="password",
+        help="Enter for this browser session; stored credentials are never prefilled.",
     )
     secret_key = st.sidebar.text_input(
         "Secret key",
-        value=_resolve_value("DSIMAGING_SECRET_KEY", profile, "secret_key", ""),
+        value="",
         type="password",
+        help="Enter for this browser session; stored credentials are never prefilled.",
     )
     backend = st.sidebar.selectbox(
         "Backend override",
@@ -202,9 +205,9 @@ def edit_connection_config(profile: dict) -> dict:
     )
     controller_token = st.sidebar.text_input(
         "Controller operator token",
-        value=_resolve_value(
-            "DSIMAGING_CONTROLLER_TOKEN", profile, "controller_token", ""),
+        value="",
         type="password",
+        help="Enter for this browser session; stored tokens are never prefilled.",
     )
     sqs_queue_url = st.sidebar.text_input(
         "SQS queue URL",
@@ -216,6 +219,15 @@ def edit_connection_config(profile: dict) -> dict:
         f"Secret key: **{_secret_badge(secret_key)}**  \n"
         f"Controller token: **{_secret_badge(controller_token)}**"
     )
+    if any(_resolve_value(envvar, profile, key, "") for envvar, key in (
+        ("DSIMAGING_ACCESS_KEY", "access_key"),
+        ("DSIMAGING_SECRET_KEY", "secret_key"),
+        ("DSIMAGING_CONTROLLER_TOKEN", "controller_token"),
+    )):
+        st.sidebar.caption(
+            "Stored credentials are available to the CLI but are deliberately "
+            "not loaded into this unauthenticated dashboard."
+        )
     resolved_backend, rationale = detect_backend(endpoint, backend)
     return {
         "endpoint": endpoint,
@@ -405,6 +417,10 @@ def render_publish(config: dict) -> None:
     label_column = st.text_input(
         "Label column (optional)", key="publish-label-column"
     )
+    label_levels_text = st.text_input(
+        "Public label levels (optional, comma-separated)",
+        key="publish-label-levels",
+    )
     replace = st.checkbox("Replace an existing dataset atomically", value=False)
     modality = st.selectbox("Modality", ["ct", "mri", "pet", "xray", "unknown"], index=0)
     resource_endpoint = st.text_input("Resource endpoint override", value=config["endpoint"])
@@ -422,6 +438,10 @@ def render_publish(config: dict) -> None:
                     config, dataset_id, source_path, metadata_path,
                     privacy_unit_column, label_column or None, modality,
                     replace, progress, log.append,
+                    label_levels=[
+                        value.strip() for value in label_levels_text.split(",")
+                        if value.strip()
+                    ],
                 )
                 st.success("Publish complete.")
             except Exception as exc:
@@ -616,7 +636,8 @@ def preview_modify(images_path: str, masks_path: str) -> dict:
 def publish_dataset(config: dict, dataset_id: str, source_path: str, metadata_path: str,
                     privacy_unit_column: str, label_column: str | None,
                     modality: str, replace: bool, progress,
-                    log: Callable[[str], None]) -> None:
+                    log: Callable[[str], None], *,
+                    label_levels: list[str] | None = None) -> None:
     validate_dataset_id(dataset_id)
     s3 = make_s3_client(config)
     bucket = config["bucket"]
@@ -628,20 +649,20 @@ def publish_dataset(config: dict, dataset_id: str, source_path: str, metadata_pa
     samples = scan_images(source_path)
     if not samples:
         raise ValueError("No image files found.")
+    for warning in validate_dicom_series(source_path):
+        log(f"WARN: {warning}")
     masks = scan_masks(source_path, sample_ids=[sample["sample_id"] for sample in samples])
     extra_metadata = read_metadata_table(metadata_path) if metadata_path else None
     build_samples_metadata(
         samples, extra_metadata=extra_metadata,
         privacy_unit_col=privacy_unit_column, label_col=label_column,
+        label_levels=label_levels,
     )
-    sample_uploads, sample_skips = _partition_uploads(
-        s3, bucket, prefix, samples, "images", not replace
-    )
-    mask_uploads, mask_skips = _partition_uploads(
-        s3, bucket, prefix, masks, "masks", not replace
-    )
-    log(f"Images to upload: {len(sample_uploads)}; skipped: {len(sample_skips)}")
-    log(f"Masks to upload: {len(mask_uploads)}; skipped: {len(mask_skips)}")
+    # Atomic replacements must stage the complete source set.
+    sample_uploads = samples
+    mask_uploads = masks
+    log(f"Images to upload: {len(sample_uploads)}")
+    log(f"Masks to upload: {len(mask_uploads)}")
     transaction = _atomic_upload_sources(
         s3, bucket, prefix, sample_uploads, mask_uploads, replace=replace,
         require_empty=not replace,
@@ -649,9 +670,9 @@ def publish_dataset(config: dict, dataset_id: str, source_path: str, metadata_pa
     try:
         transaction["mutated"] = True
         published_objects = list_objects(
-            s3, bucket, f"{prefix}/source/images/")
+            s3, bucket, f"{prefix}/source/images/", include_version_ids=True)
         published_mask_objects = list_objects(
-            s3, bucket, f"{prefix}/source/masks/")
+            s3, bucket, f"{prefix}/source/masks/", include_version_ids=True)
         published_samples = scan_s3_images(
             s3, bucket, prefix, published_objects)
         published_masks = scan_s3_masks(
@@ -663,6 +684,7 @@ def publish_dataset(config: dict, dataset_id: str, source_path: str, metadata_pa
             published_samples, published_masks,
             extra_metadata, privacy_unit_col=privacy_unit_column,
             label_col=label_column,
+            label_levels=label_levels,
             publish_lock=transaction["publish_lock"],
         )
     except Exception:

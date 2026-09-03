@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -25,6 +26,12 @@ from dsimaging_admin.cli import (
 
 
 class DatasetCliTests(unittest.TestCase):
+    def test_publish_help_does_not_advertise_unreachable_skip_mode(self):
+        result = CliRunner().invoke(main, ["dataset", "publish", "--help"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertNotIn("--no-skip", result.output)
+
     def test_non_atomic_publication_is_disabled(self):
         result = CliRunner().invoke(main, [
             "dataset", "publish", "--dataset-id", "study",
@@ -105,6 +112,74 @@ class DatasetCliTests(unittest.TestCase):
                 s3.get_object(Bucket=bucket, Key=lock_key)["Body"].read(),
                 replacement,
             )
+
+    @unittest.skipUnless(HAS_MOTO, "moto is not installed")
+    def test_publish_records_immutable_version_for_quick_verify(self):
+        with mock_aws(), tempfile.TemporaryDirectory() as tmpdir:
+            bucket = "imaging-data"
+            s3 = boto3.client("s3", region_name="us-east-1")
+            s3.create_bucket(Bucket=bucket)
+            s3.put_bucket_versioning(
+                Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+            runner = CliRunner()
+            self._publish_one(
+                runner, bucket, tmpdir, "study", "case001", "patient-a",
+                "versioned",
+            )
+
+            result = runner.invoke(main, [
+                "--backend", "aws", "--bucket", bucket,
+                "dataset", "verify", "study", "--quick", "--output", "json",
+            ])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertEqual(json.loads(result.output)["quick_ok"], 1)
+
+    @unittest.skipUnless(HAS_MOTO, "moto is not installed")
+    def test_label_levels_survive_publish_copy_rescan_and_verify(self):
+        with mock_aws(), tempfile.TemporaryDirectory() as tmpdir:
+            bucket = "imaging-data"
+            s3 = boto3.client("s3", region_name="us-east-1")
+            s3.create_bucket(Bucket=bucket)
+            source = self._make_source(
+                tmpdir, "case001", b"nifti", root="label-levels")
+            metadata = os.path.join(tmpdir, "labels.csv")
+            with open(metadata, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "sample_id,patient_id,label\ncase001,patient-a,case\n")
+            runner = CliRunner()
+            publish_result = runner.invoke(main, [
+                "--backend", "aws", "--bucket", bucket,
+                "dataset", "publish", "--dataset-id", "source",
+                "--source", source, "--metadata", metadata,
+                "--privacy-unit-column", "patient_id",
+                "--label-column", "label",
+                "--public-label-level", "case",
+                "--public-label-level", "control",
+                "--skip-dicom-checks",
+            ])
+            self.assertEqual(publish_result.exit_code, 0, publish_result.output)
+
+            copy_result = runner.invoke(main, [
+                "--backend", "aws", "--bucket", bucket,
+                "dataset", "copy", "source", "target", "--yes",
+            ])
+            self.assertEqual(copy_result.exit_code, 0, copy_result.output)
+            rescan_result = runner.invoke(main, [
+                "--backend", "aws", "--bucket", bucket,
+                "dataset", "rescan", "target",
+            ])
+            self.assertEqual(rescan_result.exit_code, 0, rescan_result.output)
+            verify_result = runner.invoke(main, [
+                "--backend", "aws", "--bucket", bucket,
+                "dataset", "verify", "target", "--output", "json",
+            ])
+            self.assertEqual(verify_result.exit_code, 0, verify_result.output)
+            self.assertTrue(json.loads(verify_result.output)["ok"])
+            manifest = yaml.safe_load(s3.get_object(
+                Bucket=bucket, Key="datasets/target/manifest.yaml")["Body"].read())
+            self.assertEqual(
+                manifest["metadata"]["label_levels"], ["case", "control"])
 
     @unittest.skipUnless(HAS_MOTO, "moto is not installed")
     def test_publish_failure_restores_exact_previous_dataset(self):

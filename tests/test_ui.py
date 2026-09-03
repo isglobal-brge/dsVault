@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -169,6 +170,31 @@ class UISourceTests(unittest.TestCase):
         self.assertNotIn("opal", text)
         self.assertNotIn("urllib", text)
 
+    @unittest.skipUnless(HAS_STREAMLIT, "streamlit testing extra is not installed")
+    def test_ui_publish_reports_dicom_warnings(self):
+        from dsimaging_admin import ui
+
+        logs = []
+        with patch.object(ui, "make_s3_client", return_value=object()), \
+                patch.object(ui, "list_objects", return_value=[]), \
+                patch.object(ui, "scan_images", return_value=[{"sample_id": "case001"}]), \
+                patch.object(ui, "validate_dicom_series", return_value=["bad series"]), \
+                patch.object(ui, "scan_masks", return_value=[]), \
+                patch.object(
+                    ui, "build_samples_metadata",
+                    side_effect=RuntimeError("stop before upload")
+                ) as metadata_builder:
+            with self.assertRaisesRegex(RuntimeError, "stop before upload"):
+                ui.publish_dataset(
+                    {"bucket": "imaging-data"}, "study", "/source", "",
+                    "patient_id", None, "ct", False, None, logs.append,
+                    label_levels=["case"],
+                )
+
+        self.assertIn("WARN: bad series", logs)
+        self.assertEqual(
+            metadata_builder.call_args.kwargs["label_levels"], ["case"])
+
 
 @unittest.skipUnless(HAS_STREAMLIT, "streamlit testing extra is not installed")
 class StreamlitUITests(unittest.TestCase):
@@ -246,7 +272,19 @@ class StreamlitUITests(unittest.TestCase):
         text = rendered_text(at)
         self.assertNotIn("secret-access", text)
         self.assertNotIn("secret-key", text)
-        self.assertIn("set [ok]", text)
+        secret_fields = {
+            field.label: field.value
+            for field in at.text_input
+            if field.label in {
+                "Access key", "Secret key", "Controller operator token"
+            }
+        }
+        self.assertEqual(secret_fields, {
+            "Access key": "",
+            "Secret key": "",
+            "Controller operator token": "",
+        })
+        self.assertIn("not set", text)
 
     @unittest.skipUnless(HAS_MOTO, "moto is not installed")
     def test_datasets_tab_with_moto_s3(self):

@@ -311,10 +311,11 @@ def generate_manifest(dataset_id: str, bucket: str, prefix: str,
                       mask_asset: str = "masks", *,
                       privacy_unit_col: str,
                       label_col: str | None = None,
+                      label_levels: list[str] | tuple[str, ...] | None = None,
                       existing_manifest: dict | None = None) -> dict:
     """Generate a manifest dict for a dataset."""
     validate_dataset_id(dataset_id)
-    contract = metadata_contract(privacy_unit_col, label_col)
+    contract = metadata_contract(privacy_unit_col, label_col, label_levels)
     manifest = deepcopy(existing_manifest) if existing_manifest is not None else {}
     manifest.update({
         "schema_version": manifest.get("schema_version", 1),
@@ -357,7 +358,8 @@ def generate_manifest(dataset_id: str, bucket: str, prefix: str,
 
 
 def metadata_contract(privacy_unit_col: str,
-                      label_col: str | None = None) -> dict:
+                      label_col: str | None = None,
+                      label_levels: list[str] | tuple[str, ...] | None = None) -> dict:
     """Return the pinned disclosure-control contract for sample metadata."""
     privacy_unit_col = _validate_column_name(privacy_unit_col, "privacy_unit_col")
     if (privacy_unit_col == ID_COL or
@@ -378,6 +380,9 @@ def metadata_contract(privacy_unit_col: str,
                 "label_col must be distinct from sample and patient columns"
             )
         contract["label_col"] = label_col
+    public_levels = _validate_public_label_levels(label_levels, label_col)
+    if public_levels:
+        contract["label_levels"] = public_levels
     return contract
 
 
@@ -397,7 +402,8 @@ def metadata_contract_from_manifest(manifest: dict) -> dict:
             "manifest metadata.privacy_unit_canonicalization must be 'trim-utf8-v2'"
         )
     return metadata_contract(
-        metadata.get("privacy_unit_col"), metadata.get("label_col")
+        metadata.get("privacy_unit_col"), metadata.get("label_col"),
+        metadata.get("label_levels"),
     )
 
 
@@ -577,7 +583,8 @@ def build_sample_manifests(samples: list[dict]) -> pa.Table:
 def build_samples_metadata(samples: list[dict],
                            extra_metadata: pa.Table | None = None, *,
                            privacy_unit_col: str | None = None,
-                           label_col: str | None = None) -> pa.Table:
+                           label_col: str | None = None,
+                           label_levels: list[str] | tuple[str, ...] | None = None) -> pa.Table:
     """Build sample metadata from an exact image/metadata sample roster."""
     _validate_sample_ids(samples)
     if not samples:
@@ -591,7 +598,7 @@ def build_samples_metadata(samples: list[dict],
         else:
             result = _left_join_metadata(base, extra_metadata)
         return validate_samples_metadata(
-            result, privacy_unit_col, label_col
+            result, privacy_unit_col, label_col, label_levels
         ) if privacy_unit_col is not None else result
     base = pa.table({
         "sample_id": [s["sample_id"] for s in samples],
@@ -600,14 +607,15 @@ def build_samples_metadata(samples: list[dict],
     })
     result = base if extra_metadata is None else _left_join_metadata(base, extra_metadata)
     return validate_samples_metadata(
-        result, privacy_unit_col, label_col
+        result, privacy_unit_col, label_col, label_levels
     ) if privacy_unit_col is not None else result
 
 
 def validate_samples_metadata(table: pa.Table, privacy_unit_col: str,
-                              label_col: str | None = None) -> pa.Table:
+                              label_col: str | None = None,
+                              label_levels: list[str] | tuple[str, ...] | None = None) -> pa.Table:
     """Fail closed unless every sample has its pinned patient unit and label."""
-    contract = metadata_contract(privacy_unit_col, label_col)
+    contract = metadata_contract(privacy_unit_col, label_col, label_levels)
     table = _normalise_metadata_table(table)
     ids = table[ID_COL].to_pylist()
     _validate_values(ids, ID_COL, canonical_patient_ids=False)
@@ -631,6 +639,19 @@ def validate_samples_metadata(table: pa.Table, privacy_unit_col: str,
             index = table.column_names.index(column)
             table = table.set_column(
                 index, column, pa.array(values, type=pa.string()))
+    public_levels = contract.get("label_levels")
+    if public_levels:
+        labels = [str(value) for value in table[contract["label_col"]].to_pylist()]
+        if not set(labels).issubset(set(public_levels)):
+            raise ValueError(
+                "metadata labels must belong to the declared public label vocabulary"
+            )
+        identifiers = set(ids)
+        identifiers.update(table[contract["privacy_unit_col"]].to_pylist())
+        if identifiers.intersection(public_levels):
+            raise ValueError(
+                "metadata labels must not equal sample or patient identifiers"
+            )
     return table
 
 
@@ -657,6 +678,31 @@ def _validate_column_name(value, field: str) -> str:
     if not isinstance(value, str) or not value.strip(_ASCII_ID_TRIM):
         raise ValueError(f"{field} must be a non-empty column name")
     return value.strip(_ASCII_ID_TRIM)
+
+
+def _validate_public_label_levels(
+        values: list[str] | tuple[str, ...] | None,
+        label_col: str | None) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, (str, bytes)) or not isinstance(values, (list, tuple)):
+        raise ValueError("label_levels must be a sequence of public labels")
+    levels = list(values)
+    if not levels:
+        return []
+    if label_col is None:
+        raise ValueError("label_levels require label_col")
+    for value in levels:
+        if (not isinstance(value, str) or not value or
+                len(value.encode("utf-8", errors="strict")) > 128 or
+                not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", value) or
+                re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", value)):
+            raise ValueError(
+                "label_levels must contain only safe public identifiers"
+            )
+    if len(levels) != len(set(levels)):
+        raise ValueError("label_levels must be unique")
+    return levels
 
 
 def _canonical_identifier(value) -> str:

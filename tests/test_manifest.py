@@ -145,6 +145,7 @@ class ManifestTests(unittest.TestCase):
             has_masks=True,
             privacy_unit_col="patient_id",
             label_col="diagnosis",
+            label_levels=["case", "control"],
         )
 
         self.assertEqual(manifest["assets"]["masks"]["kind"], "mask_root")
@@ -158,6 +159,7 @@ class ManifestTests(unittest.TestCase):
             "privacy_unit_col": "patient_id",
             "privacy_unit_canonicalization": "trim-utf8-v2",
             "label_col": "diagnosis",
+            "label_levels": ["case", "control"],
         })
 
     def test_generate_manifest_rejects_preserved_cross_collection_asset(self):
@@ -352,6 +354,57 @@ class ManifestTests(unittest.TestCase):
             metadata_contract("patient_id", "patient_id")
         with self.assertRaisesRegex(ValueError, "distinct"):
             metadata_contract("patient_id", "n_files")
+
+    def test_public_label_vocabulary_is_explicit_and_safe(self):
+        contract = metadata_contract(
+            "patient_id", "label", ["case", "control"])
+        self.assertEqual(contract["label_levels"], ["case", "control"])
+        with self.assertRaisesRegex(ValueError, "require label_col"):
+            metadata_contract("patient_id", label_levels=["case"])
+        with self.assertRaisesRegex(ValueError, "safe public"):
+            metadata_contract("patient_id", "label", ["s3://secret"])
+        with self.assertRaisesRegex(ValueError, "unique"):
+            metadata_contract("patient_id", "label", ["case", "case"])
+
+    def test_samples_metadata_enforces_public_label_vocabulary(self):
+        samples = [
+            {
+                "sample_id": sample_id,
+                "source_kind": "single_file",
+                "primary_filename": f"{sample_id}.nii.gz",
+                "uri_path": f"{sample_id}.nii.gz",
+                "files": [{"path": f"{sample_id}.nii.gz", "role": "primary"}],
+                "content_hash": sample_id,
+                "size": 1,
+            }
+            for sample_id in ("case001", "case002")
+        ]
+        metadata = read_metadata_table(self._metadata_csv(
+            "sample_id,patient_id,label\ncase001,patient-a,case\n"
+            "case002,patient-b,control\n"
+        ))
+        build_samples_metadata(
+            samples, extra_metadata=metadata, privacy_unit_col="patient_id",
+            label_col="label", label_levels=["case", "control"],
+        )
+        with self.assertRaisesRegex(ValueError, "public label vocabulary"):
+            build_samples_metadata(
+                samples, extra_metadata=metadata,
+                privacy_unit_col="patient_id", label_col="label",
+                label_levels=["case"],
+            )
+        with self.assertRaisesRegex(ValueError, "sample or patient identifiers"):
+            build_samples_metadata(
+                samples, extra_metadata=metadata,
+                privacy_unit_col="patient_id", label_col="label",
+                label_levels=["case", "control", "patient-a"],
+            )
+        with self.assertRaisesRegex(ValueError, "sample or patient identifiers"):
+            build_samples_metadata(
+                samples, extra_metadata=metadata,
+                privacy_unit_col="patient_id", label_col="label",
+                label_levels=["case", "control", "case001"],
+            )
 
     def test_sample_ids_that_change_under_canonicalization_are_rejected(self):
         samples = [{

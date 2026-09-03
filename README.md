@@ -26,7 +26,7 @@ The generated project pins the published multi-architecture controller, MinIO
 and MinIO client images by both release tag and manifest-list digest. Use
 `--controller-image` only to select a deliberate controller upgrade.
 The controller image is also directly available as
-`davidsarrat/dsimaging-store:0.3.8` for `linux/amd64` and `linux/arm64`.
+`davidsarrat/dsimaging-store:0.3.9` for `linux/amd64` and `linux/arm64`.
 
 New local projects generate unique MinIO credentials and an operator token in
 `./study-store/.env` (mode `0600`). MinIO's API, console and controller are
@@ -69,13 +69,15 @@ dsimaging-admin init \
 ## Dataset operations
 
 ```bash
-# Publish with staging, publish lock, skip-if-hash-matches and DICOM checks.
+# Publish with staging, a publish lock and DICOM checks.
 dsimaging-admin dataset publish \
   --dataset-id study_ct_v1 \
   --source /data/study_ct \
   --metadata /data/study_ct/clinical.csv \
   --privacy-unit-column patient_id \
   --label-column diagnosis \
+  --public-label-level case \
+  --public-label-level control \
   --modality ct
 
 # Inspect and verify.
@@ -109,11 +111,16 @@ pip install "dsimaging-admin[ui]"
 dsimaging-admin ui launch
 ```
 
+The dashboard is deliberately loopback-only; use an SSH tunnel when operating
+it remotely. Stored access keys, secret keys and controller tokens are never
+prefilled into browser widget state. Enter any credentials needed for that UI
+session explicitly, or use the CLI profile directly.
+
 By default it binds to `127.0.0.1:8501`. This is an operator-only tool for
 administrators with storage access: it has full visibility of bucket paths,
 object sizes, manifests, controller responses and backend errors. It does not
 add an authentication layer, so keep the default localhost bind unless you are
-running it inside a trusted administrative environment. Access keys, secret keys,
+running it through a loopback SSH tunnel. Access keys, secret keys,
 KMS keys and webhook tokens are entered as password fields and are only shown as
 set/not-set indicators after entry. Installing `streamlit-autorefresh`
 separately enables automatic controller polling; otherwise the UI keeps a manual
@@ -134,21 +141,19 @@ dsimaging-admin doctor --output json
    `masks/`, `source/labels/`, or `labels/`.
 2. Runs basic DICOM sanity checks for series UID, modality and instance order.
 3. Computes SHA-256 content hashes.
-4. Skips uploads that already match the current dataset hash indexes.
-5. Uploads through `datasets/<id>/.staging-*` and a `.publish-lock`, then copies
+4. Uploads through `datasets/<id>/.staging-*` and a `.publish-lock`, then copies
    into `datasets/<id>/source/...`; derived objects are generated before upload
    and `manifest.yaml` is written last.
-6. Generates and uploads:
+5. Generates and uploads:
    - `manifest.yaml`
    - `indexes/content_hash_index.parquet`
    - `indexes/masks_content_hash_index.parquet` when masks exist
    - `metadata/sample_manifests.parquet`
    - `metadata/samples.parquet`
 
-Use `--dry-run` to scan and show the upload plan without S3 writes or
-`--no-skip` to force uploads. Published datasets always use staging and an
-atomic publication lock; `--no-atomic` is retained only to produce an explicit
-compatibility error.
+Use `--dry-run` to scan and show the upload plan without S3 writes. Published
+datasets always use staging and an atomic publication lock; `--no-atomic` is
+retained only to produce an explicit compatibility error.
 
 Every publication pins this disclosure-control contract under `manifest.yaml`'s
 `metadata` mapping:
@@ -159,10 +164,15 @@ privacy_unit: patient
 privacy_unit_col: patient_id
 privacy_unit_canonicalization: trim-utf8-v2
 label_col: diagnosis  # omitted when --label-column is not supplied
+label_levels: [case, control]  # omitted unless explicitly approved by the operator
 ```
 
 `--privacy-unit-column` is required. Every discovered sample must have a
 non-empty value in that metadata column and, when declared, in `--label-column`.
+Repeat `--public-label-level` to declare the finite label vocabulary that may be
+used by disclosure-controlled aggregate results. Undeclared values, unsafe
+identifiers, duplicates, and values equal to sample or patient identifiers are
+rejected; without this explicit vocabulary, label distributions stay withheld.
 The metadata `sample_id` roster must match the discovered image roster exactly;
 duplicates, missing rows and unrelated extra rows are rejected. The patient and
 optional label columns must be dedicated columns, while multiple distinct
@@ -234,6 +244,11 @@ mappings, sizes and selected object hashes, and refuses verification while a
 publish lock exists. Missing, extra, duplicate, orphaned, cross-collection, or
 corrupt publication metadata makes verification fail rather than accepting a
 reduced view of the collection.
+
+Fractional verification rotates its cryptographic sample on every invocation,
+so scheduled checks do not retain a permanent blind spot. `--quick` skips a
+SHA-256 read only when an immutable recorded S3 version ID still matches; an
+ETag alone is never treated as proof of content integrity.
 
 ## Dataset layout in S3
 

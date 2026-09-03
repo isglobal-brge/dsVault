@@ -1,5 +1,16 @@
 # NEWS
 
+## 0.3.9
+
+- Collection publication carries an explicit public label vocabulary through
+  copy, reconciliation and verification, while rejecting vocabularies that
+  expose sample or patient identifiers.
+- Quick verification now uses immutable non-null S3 object versions and falls
+  back to full verification whenever that guarantee is unavailable.
+- Store configuration writes are atomic and private, the UI applies the same
+  DICOM checks as the CLI, and generated stores use a dedicated authenticated
+  webhook credential.
+
 ## 0.3.8
 
 - The declared minimum Python version is now 3.10, matching the requirement of

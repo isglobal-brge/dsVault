@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import secrets
 from dataclasses import dataclass, asdict
 
 import pyarrow as pa
@@ -64,6 +65,7 @@ def verify_dataset(s3, bucket: str, dataset_id: str,
     skipped = 0
     quick_ok = 0
     represented_keys: set[str] = set()
+    sampling_key = secrets.token_bytes(32)
 
     tables = []
     main_table = _read_parquet_object(s3, bucket, f"{prefix}/indexes/content_hash_index.parquet")
@@ -82,7 +84,7 @@ def verify_dataset(s3, bucket: str, dataset_id: str,
 
     for asset_name, table in tables:
         rows = table.to_pylist()
-        selected = _sample_rows(rows, sample_fraction)
+        selected = _sample_rows(rows, sample_fraction, sampling_key)
         skipped += len(rows) - len(selected)
         for row in rows:
             represented_keys.update(_represented_keys(s3, bucket, row))
@@ -157,7 +159,8 @@ def _publication_contract_issues(s3, bucket: str, prefix: str,
         metadata = _read_parquet_object(
             s3, bucket, f"{prefix}/metadata/samples.parquet")
         metadata = validate_samples_metadata(
-            metadata, contract["privacy_unit_col"], contract.get("label_col"))
+            metadata, contract["privacy_unit_col"], contract.get("label_col"),
+            contract.get("label_levels"))
         sample_manifests = _read_parquet_object(
             s3, bucket, f"{prefix}/metadata/sample_manifests.parquet")
         index_ids = index["sample_id"].to_pylist()
@@ -340,13 +343,17 @@ def _positive_integer(value, field: str) -> int:
     return numeric
 
 
-def _sample_rows(rows: list[dict], fraction: float) -> list[dict]:
+def _sample_rows(rows: list[dict], fraction: float,
+                 sampling_key: bytes) -> list[dict]:
     if fraction >= 1 or not rows:
         return rows
     count = max(1, int(math.ceil(len(rows) * fraction)))
     return sorted(
         rows,
-        key=lambda row: hashlib.sha256(str(row.get("sample_id", "")).encode()).hexdigest(),
+        key=lambda row: hashlib.sha256(
+            sampling_key + b"\x00" +
+            str(row.get("sample_id", "")).encode("utf-8")
+        ).hexdigest(),
     )[:count]
 
 
@@ -371,7 +378,7 @@ def _verify_row(s3, configured_bucket: str, row: dict,
     sample_id = row.get("sample_id") or ""
     expected_hash = row.get("content_hash") or ""
     expected_size = int(row.get("size") or 0)
-    expected_etag = row.get("etag")
+    expected_version = row.get("version_id")
 
     try:
         uri_bucket, key = parse_s3_uri(uri)
@@ -383,7 +390,7 @@ def _verify_row(s3, configured_bucket: str, row: dict,
     if source_kind == "dicom_series" or key.endswith("/"):
         return _verify_dicom_series(
             s3, bucket, key, sample_id, uri, expected_hash,
-            expected_size, expected_etag, quick,
+            expected_size, quick,
             expected_n_files=(manifest_rows.get(sample_id) or {}).get("n_files"),
         )
 
@@ -395,7 +402,12 @@ def _verify_row(s3, configured_bucket: str, row: dict,
             sample_id, uri, "mismatch",
             f"size {meta.get('size')} != recorded {expected_size}",
         ), {key}, False
-    if quick and expected_etag and meta.get("etag") == expected_etag and meta.get("size") == expected_size:
+    # A matching immutable version id is authoritative. ETags are not: for
+    # common S3 uploads they are only MD5-derived and must never replace the
+    # recorded SHA-256 content check.
+    if (quick and expected_version not in (None, "", "null") and
+            meta.get("version_id") == expected_version and
+            meta.get("size") == expected_size):
         return None, {key}, True
 
     actual_hash = _sha256_s3_object(s3, bucket, key)
@@ -409,7 +421,7 @@ def _verify_row(s3, configured_bucket: str, row: dict,
 
 def _verify_dicom_series(s3, bucket: str, prefix_key: str, sample_id: str,
                          uri: str, expected_hash: str, expected_size: int,
-                         expected_etag: str | None, quick: bool,
+                         quick: bool,
                          expected_n_files=None,
                          ) -> tuple[VerifyIssue | None, set[str], bool]:
     prefix = prefix_key if prefix_key.endswith("/") else f"{prefix_key}/"
@@ -431,10 +443,6 @@ def _verify_dicom_series(s3, bucket: str, prefix_key: str, sample_id: str,
             sample_id, uri, "mismatch",
             f"series file count {len(objects)} != recorded {expected_n_files}",
         ), keys, False
-    etag_join = ",".join(obj.get("etag") or "" for obj in sorted(objects, key=lambda item: item["key"]))
-    if quick and expected_etag and etag_join == expected_etag and total_size == expected_size:
-        return None, keys, True
-
     h = hashlib.sha256()
     for obj in sorted(objects, key=lambda item: item["key"]):
         h.update(_sha256_s3_object(s3, bucket, obj["key"]).encode())

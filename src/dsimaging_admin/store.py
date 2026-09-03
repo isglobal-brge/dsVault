@@ -35,6 +35,7 @@ class StoreConfig:
     endpoint: str
     controller_url: str
     controller_token: str
+    webhook_token: str
     bucket: str
     access_key: str
     secret_key: str
@@ -46,6 +47,7 @@ class StoreConfig:
         data = asdict(self)
         data.pop("secret_key", None)
         data.pop("controller_token", None)
+        data.pop("webhook_token", None)
         return data
 
 
@@ -65,6 +67,7 @@ def init_store(
     controller_port: int = 8080,
     reconcile_interval: int = 10,
     controller_token: str | None = None,
+    webhook_token: str | None = None,
 ) -> StoreConfig:
     """Create a dsimaging-store Compose project directory."""
     root = Path(dest).expanduser().resolve()
@@ -89,10 +92,16 @@ def init_store(
         controller_token or previous_env.get("DSIMAGING_CONTROLLER_TOKEN") or
         secrets.token_urlsafe(32)
     )
+    webhook_token = (
+        webhook_token or previous_env.get("DSIMAGING_WEBHOOK_TOKEN") or
+        secrets.token_urlsafe(32)
+    )
     access_key = _safe_env_value("MinIO access key", access_key, min_length=3)
     secret_key = _safe_env_value("MinIO secret key", secret_key, min_length=8)
     controller_token = _safe_env_value(
         "controller token", controller_token, min_length=16)
+    webhook_token = _safe_env_value(
+        "webhook token", webhook_token, min_length=16)
     controller_image = _safe_env_value("controller image", controller_image)
     minio_image = _safe_env_value("MinIO image", minio_image)
     mc_image = _safe_env_value("MinIO client image", mc_image)
@@ -131,6 +140,7 @@ def init_store(
         bucket=bucket,
         reconcile_interval=reconcile_interval,
         controller_token=controller_token,
+        webhook_token=webhook_token,
         controller_image=controller_image,
         minio_image=minio_image,
         mc_image=mc_image,
@@ -151,6 +161,7 @@ def load_store_config(path: str) -> StoreConfig:
         endpoint=f"http://127.0.0.1:{minio_port}",
         controller_url=f"http://127.0.0.1:{controller_port}",
         controller_token=env.get("DSIMAGING_CONTROLLER_TOKEN", ""),
+        webhook_token=env.get("DSIMAGING_WEBHOOK_TOKEN", ""),
         bucket=env.get("BUCKET_NAME", "imaging-data"),
         access_key=env.get("MINIO_ROOT_USER", ""),
         secret_key=env.get("MINIO_ROOT_PASSWORD", ""),
@@ -287,6 +298,7 @@ services:
       MINIO_ROOT_PASSWORD: ${{MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}}
       MINIO_NOTIFY_WEBHOOK_ENABLE_DSIMAGING: "on"
       MINIO_NOTIFY_WEBHOOK_ENDPOINT_DSIMAGING: "http://controller:8080/webhook/minio"
+      MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_DSIMAGING: "Bearer ${{DSIMAGING_WEBHOOK_TOKEN:?DSIMAGING_WEBHOOK_TOKEN is required}}"
     volumes:
       - minio-data:/data
     healthcheck:
@@ -307,6 +319,7 @@ services:
       BUCKET_NAME: ${{BUCKET_NAME:-imaging-data}}
       RECONCILE_INTERVAL_SECONDS: ${{RECONCILE_INTERVAL_SECONDS:-10}}
       DSIMAGING_CONTROLLER_TOKEN: ${{DSIMAGING_CONTROLLER_TOKEN:-}}
+      DSIMAGING_WEBHOOK_TOKEN: ${{DSIMAGING_WEBHOOK_TOKEN:?DSIMAGING_WEBHOOK_TOKEN is required}}
       DSIMAGING_MAX_WEBHOOK_BODY_BYTES: ${{DSIMAGING_MAX_WEBHOOK_BODY_BYTES:-1048576}}
     depends_on:
       minio:
@@ -345,6 +358,7 @@ BUCKET_NAME={bucket}
 RECONCILE_INTERVAL_SECONDS={reconcile_interval}
 DSIMAGING_MAX_WEBHOOK_BODY_BYTES=1048576
 DSIMAGING_CONTROLLER_TOKEN={controller_token}
+DSIMAGING_WEBHOOK_TOKEN={webhook_token}
 WEBHOOK_RETRIES=12
 WEBHOOK_RETRY_SECONDS=5
 DSIMAGING_STORE_CONTROLLER_IMAGE={controller_image}
@@ -364,7 +378,9 @@ BUCKET_NAME="${BUCKET_NAME:-imaging-data}"
 WEBHOOK_RETRIES="${WEBHOOK_RETRIES:-12}"
 WEBHOOK_RETRY_SECONDS="${WEBHOOK_RETRY_SECONDS:-5}"
 
-mc alias set local "${MINIO_ENDPOINT}" "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}" --api s3v4
+printf '{"url":"%s","accessKey":"%s","secretKey":"%s","api":"s3v4","path":"auto"}\n' \
+  "${MINIO_ENDPOINT}" "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}" \
+  | mc alias import local/ >/dev/null
 
 if mc ls "local/${BUCKET_NAME}" >/dev/null 2>&1; then
   echo "[init] Bucket '${BUCKET_NAME}' already exists"
