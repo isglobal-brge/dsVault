@@ -19,10 +19,12 @@ except Exception:
     HAS_MOTO = False
 
 from dsimaging_admin.cli import (
+    _assert_source_inventory_unchanged,
     _atomic_upload_sources,
     _finish_atomic_publish,
     main,
 )
+from dsimaging_admin.s3 import list_objects
 
 
 class DatasetCliTests(unittest.TestCase):
@@ -134,6 +136,39 @@ class DatasetCliTests(unittest.TestCase):
 
             self.assertEqual(result.exit_code, 0, result.output)
             self.assertEqual(json.loads(result.output)["quick_ok"], 1)
+
+    @unittest.skipUnless(HAS_MOTO, "moto is not installed")
+    def test_publish_rolls_back_if_source_version_changes_before_manifest(self):
+        with mock_aws(), tempfile.TemporaryDirectory() as tmpdir:
+            bucket = "imaging-data"
+            prefix = "datasets/study"
+            s3 = boto3.client("s3", region_name="us-east-1")
+            s3.create_bucket(Bucket=bucket)
+            s3.put_bucket_versioning(
+                Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+            source = self._make_source(tmpdir, "case001", b"image")
+            metadata = self._make_metadata(
+                tmpdir, [("case001", "patient-a")], "metadata.csv")
+
+            with patch(
+                "dsimaging_admin.cli._assert_source_inventory_unchanged",
+                side_effect=self._replace_source_with_identical_new_version,
+            ):
+                result = CliRunner().invoke(main, [
+                    "--backend", "aws", "--bucket", bucket,
+                    "dataset", "publish", "--dataset-id", "study",
+                    "--source", source, "--metadata", metadata,
+                    "--privacy-unit-column", "patient_id",
+                    "--skip-dicom-checks",
+                ])
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("source inventory changed", str(result.exception))
+            self.assertEqual(
+                s3.list_objects_v2(Bucket=bucket, Prefix=f"{prefix}/").get(
+                    "Contents", []),
+                [],
+            )
 
     @unittest.skipUnless(HAS_MOTO, "moto is not installed")
     def test_label_levels_survive_publish_copy_rescan_and_verify(self):
@@ -476,6 +511,36 @@ class DatasetCliTests(unittest.TestCase):
                 self._snapshot_prefix(s3, bucket, f"{prefix}/"), before)
 
     @unittest.skipUnless(HAS_MOTO, "moto is not installed")
+    def test_rescan_restores_dataset_if_source_version_changes_before_manifest(self):
+        with mock_aws(), tempfile.TemporaryDirectory() as tmpdir:
+            bucket = "imaging-data"
+            prefix = "datasets/study"
+            s3 = boto3.client("s3", region_name="us-east-1")
+            s3.create_bucket(Bucket=bucket)
+            s3.put_bucket_versioning(
+                Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+            runner = CliRunner()
+            self._publish_one(
+                runner, bucket, tmpdir, "study", "case001", "patient-a",
+                "initial",
+            )
+            before = self._snapshot_prefix(s3, bucket, f"{prefix}/")
+
+            with patch(
+                "dsimaging_admin.cli._assert_source_inventory_unchanged",
+                side_effect=self._replace_source_with_identical_new_version,
+            ):
+                result = runner.invoke(main, [
+                    "--backend", "aws", "--bucket", bucket,
+                    "dataset", "rescan", "study",
+                ])
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("source inventory changed", str(result.exception))
+            self.assertEqual(
+                self._snapshot_prefix(s3, bucket, f"{prefix}/"), before)
+
+    @unittest.skipUnless(HAS_MOTO, "moto is not installed")
     def test_copy_failure_restores_destination_and_releases_source_lock(self):
         with mock_aws(), tempfile.TemporaryDirectory() as tmpdir:
             bucket = "imaging-data"
@@ -514,6 +579,68 @@ class DatasetCliTests(unittest.TestCase):
                 self._snapshot_prefix(s3, bucket, "datasets/target/"),
                 target_before,
             )
+
+    @unittest.skipUnless(HAS_MOTO, "moto is not installed")
+    def test_copy_removes_destination_if_source_version_changes_before_manifest(self):
+        with mock_aws(), tempfile.TemporaryDirectory() as tmpdir:
+            bucket = "imaging-data"
+            s3 = boto3.client("s3", region_name="us-east-1")
+            s3.create_bucket(Bucket=bucket)
+            s3.put_bucket_versioning(
+                Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+            runner = CliRunner()
+            self._publish_one(
+                runner, bucket, tmpdir, "source", "case001", "patient-a",
+                "source-files",
+            )
+            source_before = self._snapshot_prefix(
+                s3, bucket, "datasets/source/")
+
+            with patch(
+                "dsimaging_admin.cli._assert_source_inventory_unchanged",
+                side_effect=self._replace_source_with_identical_new_version,
+            ):
+                result = runner.invoke(main, [
+                    "--backend", "aws", "--bucket", bucket,
+                    "dataset", "copy", "source", "target", "--yes",
+                ])
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("source inventory changed", str(result.exception))
+            self.assertEqual(
+                self._snapshot_prefix(s3, bucket, "datasets/source/"),
+                source_before,
+            )
+            self.assertEqual(
+                s3.list_objects_v2(
+                    Bucket=bucket, Prefix="datasets/target/"
+                ).get("Contents", []),
+                [],
+            )
+
+    @unittest.skipUnless(HAS_MOTO, "moto is not installed")
+    def test_source_inventory_recheck_detects_dicom_slice_version_change(self):
+        with mock_aws():
+            bucket = "imaging-data"
+            prefix = "datasets/study"
+            s3 = boto3.client("s3", region_name="us-east-1")
+            s3.create_bucket(Bucket=bucket)
+            s3.put_bucket_versioning(
+                Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+            for filename in ("001.dcm", "002.dcm"):
+                s3.put_object(
+                    Bucket=bucket,
+                    Key=f"{prefix}/source/images/series1/{filename}",
+                    Body=filename.encode("utf-8"),
+                )
+            expected_images = list_objects(
+                s3, bucket, f"{prefix}/source/images/",
+                include_version_ids=True,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "source inventory changed"):
+                self._replace_source_with_identical_new_version(
+                    s3, bucket, prefix, expected_images, [])
 
     @unittest.skipUnless(HAS_MOTO, "moto is not installed")
     def test_copy_defers_to_an_active_source_lock(self):
@@ -633,6 +760,16 @@ class DatasetCliTests(unittest.TestCase):
                 "Body"].read()
             for item in objects
         }
+
+    def _replace_source_with_identical_new_version(
+        self, s3, bucket: str, prefix: str,
+        expected_images: list[dict], expected_masks: list[dict],
+    ) -> None:
+        key = expected_images[-1]["key"]
+        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        s3.put_object(Bucket=bucket, Key=key, Body=body)
+        _assert_source_inventory_unchanged(
+            s3, bucket, prefix, expected_images, expected_masks)
 
 
 if __name__ == "__main__":

@@ -640,6 +640,8 @@ def publish(ctx, dataset_id, source, metadata, privacy_unit_column, label_column
         _write_dataset_artifacts(
             s3, bucket, prefix, dataset_id, modality, published_samples,
             masks=published_masks, extra_metadata=extra_metadata,
+            expected_images=published_objects,
+            expected_masks=published_mask_objects,
             privacy_unit_col=privacy_unit_column, label_col=label_column,
             label_levels=label_levels,
             publish_lock=transaction["publish_lock"],
@@ -919,6 +921,8 @@ def copy_cmd(ctx, src_id, dst_id, yes, replace):
             s3, bucket, dst_prefix, dst_id,
             source_manifest.get("modality") or "unknown", samples,
             masks=masks, extra_metadata=extra_metadata,
+            expected_images=objects,
+            expected_masks=masks_objects,
             privacy_unit_col=contract["privacy_unit_col"],
             label_col=contract.get("label_col"),
             label_levels=contract.get("label_levels"),
@@ -1183,6 +1187,8 @@ def _rescan_dataset_artifacts(s3, bucket: str, dataset_id: str,
         s3, bucket, prefix, dataset_id,
         existing_manifest.get("modality") or "unknown", samples,
         masks=masks, extra_metadata=extra_metadata,
+        expected_images=objects,
+        expected_masks=mask_objects,
         privacy_unit_col=contract["privacy_unit_col"],
         label_col=contract.get("label_col"),
         label_levels=contract.get("label_levels"),
@@ -1244,9 +1250,29 @@ def _all_keys_exist(s3, bucket: str, keys: list[str]) -> bool:
 
 def _object_inventory(objects: list[dict]) -> list[tuple]:
     return sorted(
-        (obj["key"], int(obj.get("size", 0)), obj.get("etag"))
+        (
+            obj["key"], int(obj.get("size", 0)), obj.get("etag"),
+            obj.get("version_id"),
+        )
         for obj in objects
     )
+
+
+def _assert_source_inventory_unchanged(
+    s3,
+    bucket: str,
+    prefix: str,
+    expected_images: list[dict],
+    expected_masks: list[dict],
+) -> None:
+    current_images = list_objects(
+        s3, bucket, f"{prefix}/source/images/", include_version_ids=True)
+    current_masks = list_objects(
+        s3, bucket, f"{prefix}/source/masks/", include_version_ids=True)
+    if (_object_inventory(current_images) != _object_inventory(expected_images) or
+            _object_inventory(current_masks) != _object_inventory(expected_masks)):
+        raise RuntimeError(
+            "dataset source inventory changed while artifacts were built")
 
 
 def _delete_keys_exact(s3, bucket: str, keys: list[str]) -> None:
@@ -1421,6 +1447,8 @@ def _write_dataset_artifacts(s3, bucket: str, prefix: str, dataset_id: str,
                              modality: str, samples: list[dict],
                              masks: list[dict] | None = None,
                              extra_metadata=None, *,
+                             expected_images: list[dict],
+                             expected_masks: list[dict],
                              privacy_unit_col: str,
                              label_col: str | None = None,
                              label_levels: list[str] | tuple[str, ...] | None = None,
@@ -1481,6 +1509,11 @@ def _write_dataset_artifacts(s3, bucket: str, prefix: str, dataset_id: str,
                 _delete_keys_exact(s3, bucket, [stale_mask_index])
         s3.upload_file(sm_path, bucket, f"{prefix}/metadata/sample_manifests.parquet")
         s3.upload_file(meta_path, bucket, f"{prefix}/metadata/samples.parquet")
+        if (publish_lock is not None and
+                not _publish_lock_is_owned(s3, bucket, publish_lock)):
+            raise RuntimeError("dataset publication lock ownership was lost")
+        _assert_source_inventory_unchanged(
+            s3, bucket, prefix, expected_images, expected_masks)
         if (publish_lock is not None and
                 not _publish_lock_is_owned(s3, bucket, publish_lock)):
             raise RuntimeError("dataset publication lock ownership was lost")

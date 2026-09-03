@@ -2,9 +2,10 @@
 
 ## 0.3.10
 
-- S3 publication and reconciliation now hash the exact immutable object
-  versions recorded in collection indexes and derive each listing from one
-  coherent HEAD snapshot.
+- Single-file image and mask hashes are now bound to the exact immutable S3
+  object versions recorded in collection indexes. Listings use one coherent
+  HEAD snapshot, and publication fails if its source inventory changes before
+  the manifest commit; DICOM series remain fully rehashed.
 - Quick verification trusts a stored content hash only when it is explicitly
   attested to the same non-null S3 version; legacy indexes are fully rehashed.
 - JPEG files using either `.jpg` or `.jpeg` are recognized consistently.

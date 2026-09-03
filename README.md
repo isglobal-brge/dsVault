@@ -60,6 +60,12 @@ IAM permissions for `s3:CreateBucket`, `s3:PutBucketVersioning`,
 `sqs:SetQueueAttributes`. The resolved SQS queue URL is saved under
 `aws.sqs_queue_url` in `~/.dsimaging.yaml`.
 
+Reading and verifying a versioned collection also requires
+`s3:ListBucket`, `s3:GetObject`, and `s3:GetObjectVersion`. When the bucket
+uses SSE-KMS, grant `kms:Decrypt` for the selected key as well. Keep the usual
+write/delete permissions limited to identities that actually publish or
+modify collections.
+
 Use the generated connection details as a reusable CLI profile:
 
 ```bash

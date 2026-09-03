@@ -683,6 +683,8 @@ def publish_dataset(config: dict, dataset_id: str, source_path: str, metadata_pa
             s3, bucket, prefix, dataset_id, modality,
             published_samples, published_masks,
             extra_metadata, privacy_unit_col=privacy_unit_column,
+            expected_images=published_objects,
+            expected_masks=published_mask_objects,
             label_col=label_column,
             label_levels=label_levels,
             publish_lock=transaction["publish_lock"],
