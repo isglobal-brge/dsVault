@@ -267,6 +267,65 @@ class StreamlitUITests(unittest.TestCase):
         delete_button = [button for button in at.button if button.label == "Delete dataset"][0]
         self.assertFalse(delete_button.disabled)
 
+    @unittest.skipUnless(HAS_MOTO, "moto is not installed")
+    def test_delete_preserves_versions_unless_purge_is_selected(self):
+        for purge_versions in (False, True):
+            with self.subTest(purge_versions=purge_versions), mock_aws():
+                s3 = boto3.client(
+                    "s3",
+                    region_name="us-east-1",
+                    aws_access_key_id="testing",
+                    aws_secret_access_key="testing",
+                )
+                s3.create_bucket(Bucket="imaging-data")
+                s3.put_bucket_versioning(
+                    Bucket="imaging-data",
+                    VersioningConfiguration={"Status": "Enabled"},
+                )
+                key = "datasets/versioned_ct_v1/manifest.yaml"
+                for modality in ("ct", "mr"):
+                    s3.put_object(
+                        Bucket="imaging-data",
+                        Key=key,
+                        Body=yaml.safe_dump({
+                            "schema_version": 1,
+                            "dataset_id": "versioned_ct_v1",
+                            "modality": modality,
+                        }).encode(),
+                    )
+
+                at = AppTest.from_file(str(UI_PATH))
+                at.session_state["_s3_client"] = s3
+                at.run()
+                at.radio[0].set_value("Delete").run()
+                [
+                    checkbox for checkbox in at.checkbox
+                    if checkbox.label == "Dry run"
+                ][0].set_value(False).run()
+                purge_checkbox = [
+                    checkbox for checkbox in at.checkbox
+                    if checkbox.label == "Purge all object versions and delete markers"
+                ][0]
+                self.assertFalse(purge_checkbox.value)
+                if purge_versions:
+                    purge_checkbox.set_value(True).run()
+                [
+                    field for field in at.text_input
+                    if field.label == "Type the dataset ID to confirm"
+                ][0].set_value("versioned_ct_v1").run()
+                [
+                    button for button in at.button
+                    if button.label == "Delete dataset"
+                ][0].click().run()
+
+                history = s3.list_object_versions(
+                    Bucket="imaging-data", Prefix="datasets/versioned_ct_v1/"
+                )
+                remaining = (
+                    history.get("Versions", []) + history.get("DeleteMarkers", [])
+                )
+                self.assertEqual(bool(remaining), not purge_versions)
+
     def test_secret_inputs_do_not_echo_to_outputs(self):
         at = self.app()
         text = rendered_text(at)

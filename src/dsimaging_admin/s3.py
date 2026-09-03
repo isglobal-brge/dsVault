@@ -213,7 +213,11 @@ def delete_keys(s3, bucket: str, keys: list[str]) -> int:
             Bucket=bucket,
             Delete={"Objects": [{"Key": key} for key in chunk], "Quiet": True},
         )
-        deleted += len(chunk) - len(resp.get("Errors", []))
+        errors = resp.get("Errors", [])
+        if errors:
+            raise RuntimeError(
+                f"S3 object deletion failed for {len(errors)} item(s)")
+        deleted += len(chunk)
     return deleted
 
 
@@ -221,23 +225,20 @@ def list_object_versions(s3, bucket: str, prefix: str) -> list[dict]:
     """List object versions and delete markers under a prefix."""
     versions = []
     paginator = s3.get_paginator("list_object_versions")
-    try:
-        pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
-        for page in pages:
-            for obj in page.get("Versions", []):
-                versions.append({
-                    "key": obj["Key"],
-                    "version_id": obj.get("VersionId"),
-                    "is_delete_marker": False,
-                })
-            for obj in page.get("DeleteMarkers", []):
-                versions.append({
-                    "key": obj["Key"],
-                    "version_id": obj.get("VersionId"),
-                    "is_delete_marker": True,
-                })
-    except Exception:
-        return []
+    pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
+    for page in pages:
+        for obj in page.get("Versions", []):
+            versions.append({
+                "key": obj["Key"],
+                "version_id": obj.get("VersionId"),
+                "is_delete_marker": False,
+            })
+        for obj in page.get("DeleteMarkers", []):
+            versions.append({
+                "key": obj["Key"],
+                "version_id": obj.get("VersionId"),
+                "is_delete_marker": True,
+            })
     return versions
 
 
@@ -257,7 +258,11 @@ def delete_object_versions(s3, bucket: str, versions: list[dict]) -> int:
             Bucket=bucket,
             Delete={"Objects": objects, "Quiet": True},
         )
-        deleted += len(objects) - len(resp.get("Errors", []))
+        errors = resp.get("Errors", [])
+        if errors:
+            raise RuntimeError(
+                f"S3 version deletion failed for {len(errors)} item(s)")
+        deleted += len(objects)
     return deleted
 
 

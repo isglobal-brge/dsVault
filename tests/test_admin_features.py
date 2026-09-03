@@ -1,10 +1,12 @@
 import datetime as dt
 import hashlib
 import io
+import json
 import os
 import stat
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -18,7 +20,12 @@ from dsimaging_admin.manifest import (
     build_samples_metadata,
     generate_manifest,
 )
-from dsimaging_admin.s3 import list_objects
+from dsimaging_admin.s3 import (
+    delete_keys,
+    delete_object_versions,
+    list_object_versions,
+    list_objects,
+)
 from dsimaging_admin.store import (
     DEFAULT_CONTROLLER_IMAGE,
     DEFAULT_MC_IMAGE,
@@ -119,6 +126,35 @@ def publication_artifacts(bucket, prefix, samples, now):
 
 
 class AdminFeatureTests(unittest.TestCase):
+    def test_deletion_reports_backend_failures(self):
+        class FailingS3:
+            def delete_objects(self, **kwargs):
+                return {"Errors": [{"Code": "AccessDenied"}]}
+
+        s3 = FailingS3()
+        with self.assertRaisesRegex(RuntimeError, "object deletion failed"):
+            delete_keys(s3, "imaging-data", ["datasets/study/manifest.yaml"])
+        with self.assertRaisesRegex(RuntimeError, "version deletion failed"):
+            delete_object_versions(s3, "imaging-data", [{
+                "key": "datasets/study/manifest.yaml",
+                "version_id": "v1",
+            }])
+
+    def test_version_listing_propagates_backend_failures(self):
+        class FailingPaginator:
+            def paginate(self, **kwargs):
+                raise PermissionError("version listing denied")
+
+        class FailingS3:
+            def get_paginator(self, name):
+                self.name = name
+                return FailingPaginator()
+
+        s3 = FailingS3()
+        with self.assertRaisesRegex(PermissionError, "listing denied"):
+            list_object_versions(s3, "imaging-data", "datasets/study/")
+        self.assertEqual(s3.name, "list_object_versions")
+
     def test_versioned_listing_uses_one_coherent_head_snapshot(self):
         listed_at = dt.datetime(2026, 5, 12, tzinfo=dt.timezone.utc)
         headed_at = dt.datetime(2026, 5, 13, tzinfo=dt.timezone.utc)
@@ -271,6 +307,48 @@ class AdminFeatureTests(unittest.TestCase):
         result = runner.invoke(main, ["store", "init"])
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("Missing argument", result.output)
+
+    def test_cli_store_doctor_json_preserves_failure_exit_code(self):
+        payload = {"ok": False, "docker": {}, "controller": {}, "s3": {}}
+        with patch("dsimaging_admin.cli.create_client", return_value=object()), \
+                patch("dsimaging_admin.cli.store_doctor", return_value=payload):
+            result = CliRunner().invoke(
+                main, ["store", "doctor", ".", "--output", "json"])
+
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertEqual(json.loads(result.output), payload)
+
+    def test_cli_doctor_json_preserves_failure_exit_code(self):
+        payload = {
+            "ok": False,
+            "checks": [{
+                "name": "S3 connectivity", "status": "FAIL", "detail": "down",
+            }],
+        }
+        with patch("dsimaging_admin.cli.create_client", return_value=object()), \
+                patch("dsimaging_admin.cli._doctor_result", return_value=payload):
+            result = CliRunner().invoke(main, ["doctor", "--output", "json"])
+
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertEqual(json.loads(result.output), payload)
+
+    def test_cli_dataset_status_json_fails_for_controller_error(self):
+        controllers = [
+            {"dataset_id": "study", "has_error": True},
+            {"error": "controller unavailable"},
+        ]
+        for controller in controllers:
+            with self.subTest(controller=controller), \
+                    patch("dsimaging_admin.cli.create_client", return_value=object()), \
+                    patch("dsimaging_admin.cli._dataset_status", return_value={
+                        "dataset_id": "study", "controller": controller,
+                    }):
+                result = CliRunner().invoke(
+                    main, ["dataset", "status", "study", "--output", "json"])
+
+            self.assertEqual(result.exit_code, 1, result.output)
+            self.assertEqual(
+                json.loads(result.output)["controller"], controller)
 
     def test_cli_store_init_derives_minio_port_from_endpoint(self):
         with tempfile.TemporaryDirectory() as tmpdir:

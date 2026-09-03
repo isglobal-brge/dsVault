@@ -1,5 +1,17 @@
 # NEWS
 
+## 0.3.11
+
+- JSON health and dataset-status commands now preserve machine-readable output
+  while returning a failing process status for unhealthy stores or controller
+  reconciliation errors.
+- The operator UI can explicitly purge all stored object versions and delete
+  markers when deleting a dataset; ordinary deletion continues to preserve
+  version history by default.
+- Version listing and batched deletion failures now propagate instead of being
+  reported as an empty or partially successful purge.
+- AWS store setup examples include the required destination directory.
+
 ## 0.3.10
 
 - Single-file image and mask hashes are now bound to the exact immutable S3

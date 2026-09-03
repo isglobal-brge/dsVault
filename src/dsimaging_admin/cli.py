@@ -515,6 +515,8 @@ def store_doctor_cmd(path, output):
     result = store_doctor(path)
     if output == "json":
         _echo_json(result)
+        if not result["ok"]:
+            sys.exit(1)
         return
     click.echo("dsimaging-store health check")
     click.echo("=" * 32)
@@ -714,6 +716,8 @@ def doctor(ctx, controller_url, skip_controller, output):
     )
     if output == "json":
         _echo_json(result)
+        if not result["ok"]:
+            sys.exit(1)
         return
     click.echo("dsimaging-admin health check")
     click.echo("=" * 40)
@@ -739,8 +743,13 @@ def status(ctx, dataset_id, controller_url, skip_controller, output):
         controller_token=ctx.obj.get("controller_token"),
         skip_controller=skip_controller or ctx.obj.get("skip_controller"),
     )
+    controller = payload.get("controller") or {}
+    controller_failed = bool(
+        controller.get("error") or controller.get("has_error"))
     if output == "json":
         _echo_json(payload)
+        if controller_failed:
+            sys.exit(1)
         return
     click.echo(f"Dataset: {dataset_id}")
     click.echo(f"  Status:       {payload['status']}")
@@ -755,6 +764,8 @@ def status(ctx, dataset_id, controller_url, skip_controller, output):
         click.echo(f"  Dirty:        {ctrl.get('dirty', False)}")
         if ctrl.get("has_error"):
             click.echo("  Last reconcile error: yes (see controller logs)")
+    if controller_failed:
+        sys.exit(1)
 
 
 @dataset_group.command("verify")

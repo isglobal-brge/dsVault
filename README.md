@@ -51,7 +51,8 @@ are supplied explicitly:
 
 ```bash
 dsimaging-admin --backend aws --region eu-west-1 --bucket my-imaging \
-  store init --kms-key arn:aws:kms:eu-west-1:111122223333:key/...
+  store init ./aws-store \
+  --kms-key arn:aws:kms:eu-west-1:111122223333:key/...
 ```
 
 If `--kms-key` is omitted, the bucket uses SSE-S3 (`AES256`). The AWS path needs

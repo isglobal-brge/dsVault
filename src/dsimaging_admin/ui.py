@@ -53,10 +53,12 @@ from dsimaging_admin.manifest import (
 from dsimaging_admin.s3 import (
     create_client,
     delete_keys,
+    delete_object_versions,
     detect_backend,
     get_object_bytes,
     list_datasets,
     list_objects,
+    list_object_versions,
 )
 from dsimaging_admin.store import (
     DEFAULT_CONTROLLER_IMAGE,
@@ -493,13 +495,21 @@ def render_delete(config: dict) -> None:
     objects = list_objects(s3, bucket, prefix)
     total_bytes = sum(obj["size"] for obj in objects)
     derived_present = any("/derived/" in obj["key"] or "/qc/" in obj["key"] for obj in objects)
-    st.warning("This deletes the selected dataset prefix from the store.")
+    st.warning(
+        "This deletes current objects under the selected dataset prefix. "
+        "Enable version purging below to remove its stored history."
+    )
     st.write(f"Dataset ID: **{dataset_id}**")
     st.write(f"Total objects: **{len(objects)}**")
     st.write(f"Total bytes: **{human_bytes(total_bytes)}**")
     st.write(f"Last modified: **{max((obj['last_modified'] for obj in objects), default='not available')}**")
     st.write(f"Derived assets present: **{'yes' if derived_present else 'no'}**")
     dry_run = st.checkbox("Dry run", value=True)
+    purge_versions = st.checkbox(
+        "Purge all object versions and delete markers", value=False,
+        help=("Leave unchecked to preserve version history. Equivalent to CLI "
+              "--purge-versions; purging cannot be undone."),
+    )
     typed = st.text_input("Type the dataset ID to confirm")
     if dry_run:
         with st.expander("Keys that would be deleted"):
@@ -507,10 +517,18 @@ def render_delete(config: dict) -> None:
     disabled = typed != dataset_id
     if st.button("Delete dataset", disabled=disabled):
         deleted = delete_keys(s3, bucket, [obj["key"] for obj in objects]) if not dry_run else 0
+        version_deleted = 0
+        if not dry_run and purge_versions:
+            versions = list_object_versions(s3, bucket, prefix)
+            version_deleted = delete_object_versions(s3, bucket, versions)
         if dry_run:
             st.info(f"Dry run: {len(objects)} objects would be deleted.")
         else:
             st.success(f"Deleted {deleted} objects.")
+            if purge_versions:
+                st.success(
+                    f"Deleted {version_deleted} object versions/delete markers."
+                )
 
 
 def render_controller(config: dict) -> None:
