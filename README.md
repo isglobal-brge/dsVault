@@ -104,6 +104,13 @@ dsimaging-admin dataset modify study_ct_v1 \
 dsimaging-admin dataset rescan study_ct_v1
 dsimaging-admin dataset copy study_ct_v1 study_ct_v2 --yes
 dsimaging-admin dataset download study_ct_v1 ./debug/study_ct_v1
+dsimaging-admin dataset delete study_ct_v1 --yes
+```
+
+Ordinary deletion preserves version history. Permanently removing every object
+version and delete marker is a separate, irreversible operator decision:
+
+```bash
 dsimaging-admin dataset delete study_ct_v1 --yes --purge-versions
 ```
 
@@ -225,7 +232,7 @@ Environment variables override profile values:
 
 | Variable | Default | Description |
 |---|---|---|
-| `DSIMAGING_PROFILE` | `default` | Config profile |
+| `DSIMAGING_PROFILE` | configured `default_profile`, then `default` | Config profile |
 | `DSIMAGING_ENDPOINT` | `http://127.0.0.1:9000` | S3/MinIO endpoint |
 | `DSIMAGING_CONTROLLER_URL` | (empty) | dsimaging-store controller URL |
 | `DSIMAGING_CONTROLLER_TOKEN` | (empty) | Bearer token for controller inventory and manual reconcile |

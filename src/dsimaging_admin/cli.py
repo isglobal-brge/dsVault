@@ -21,6 +21,7 @@ from .s3 import (
     detect_backend,
     get_object_bytes,
     head_object,
+    is_native_aws_s3_endpoint,
     list_datasets,
     list_object_versions,
     list_objects,
@@ -61,28 +62,72 @@ CONFIG_PATH = os.path.expanduser("~/.dsimaging.yaml")
 PUBLISH_LOCK = ".publish-lock"
 
 
-def _load_all_config() -> dict:
-    if not os.path.exists(CONFIG_PATH):
+def _load_all_config(config_path: str | None = None) -> dict:
+    config_path = config_path or CONFIG_PATH
+    if not os.path.exists(config_path):
         return {}
     try:
         import yaml
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    except Exception:
-        return {}
+        with open(config_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as exc:
+        raise click.ClickException(
+            f"Could not read configuration file {config_path}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise click.ClickException(
+            f"Configuration file {config_path} must contain a mapping"
+        )
+    return data
+
+
+def _load_profile(profile: str | None = None) -> tuple[str, dict]:
+    data = _load_all_config()
+    selected = profile or data.get("default_profile") or "default"
+    if not isinstance(selected, str) or not selected:
+        raise click.ClickException("The configured default profile is invalid")
+    if not data and (profile is None or selected == "default"):
+        return selected, {}
+    if not data:
+        raise click.ClickException(
+            f"Configuration profile '{selected}' does not exist"
+        )
+    profiles = data.get("profiles")
+    if isinstance(profiles, dict):
+        if selected not in profiles:
+            available = ", ".join(sorted(str(name) for name in profiles)) or "none"
+            raise click.ClickException(
+                f"Configuration profile '{selected}' does not exist. "
+                f"Available profiles: {available}"
+            )
+        config = profiles[selected] or {}
+        if not isinstance(config, dict):
+            raise click.ClickException(
+                f"Configuration profile '{selected}' must contain a mapping"
+            )
+        if config.get("aws") is not None and not isinstance(config["aws"], dict):
+            raise click.ClickException(
+                f"Configuration profile '{selected}' has an invalid AWS section"
+            )
+        return selected, config
+    if profiles is not None:
+        raise click.ClickException("Configuration 'profiles' must be a mapping")
+    if selected == "default":
+        config = data.get("default", data)
+        if isinstance(config, dict):
+            if config.get("aws") is not None and not isinstance(
+                    config["aws"], dict):
+                raise click.ClickException(
+                    "Configuration profile 'default' has an invalid AWS section"
+                )
+            return selected, config
+    raise click.ClickException(
+        f"Configuration profile '{selected}' does not exist"
+    )
 
 
 def _load_config(profile: str | None = None) -> dict:
-    data = _load_all_config()
-    if not data:
-        return {}
-    selected = profile or data.get("default_profile") or "default"
-    profiles = data.get("profiles")
-    if isinstance(profiles, dict):
-        return profiles.get(selected, {})
-    if selected == "default":
-        return data.get("default", data)
-    return {}
+    return _load_profile(profile)[1]
 
 
 def _write_config_profile(profile: str, values: dict, set_default: bool = True) -> None:
@@ -98,10 +143,10 @@ def _write_config_profile(profile: str, values: dict, set_default: bool = True) 
     _write_config(data)
 
 
-def _write_config(data: dict) -> None:
+def _write_config(data: dict, config_path: str | None = None) -> None:
     import yaml
 
-    config_path = Path(CONFIG_PATH)
+    config_path = Path(config_path or CONFIG_PATH)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(
         prefix=f".{config_path.name}.", dir=config_path.parent, text=True)
@@ -163,12 +208,21 @@ def _resolve_backend(cli_value: str | None, cfg: dict) -> str:
 
 def _persist_aws_queue_url(profile: str, queue_url: str, bucket: str | None = None,
                            region: str | None = None,
-                           endpoint: str | None = None) -> None:
-    data = _load_all_config()
+                           endpoint: str | None = None,
+                           config_path: str | None = None) -> None:
+    data = _load_all_config(config_path)
     if "profiles" in data and isinstance(data["profiles"], dict):
         profiles = data.setdefault("profiles", {})
-        target = profiles.setdefault(profile or data.get("default_profile") or "default", {})
-        data.setdefault("default_profile", profile or data.get("default_profile") or "default")
+        profile_name = profile or data.get("default_profile") or "default"
+        target = profiles.get(profile_name)
+        if target is None:
+            target = {}
+            profiles[profile_name] = target
+        elif not isinstance(target, dict):
+            raise click.ClickException(
+                f"Configuration profile '{profile_name}' must contain a mapping"
+            )
+        data.setdefault("default_profile", profile_name)
     else:
         profile_name = profile or "default"
         existing = data.get("default", data) if data else {}
@@ -181,8 +235,16 @@ def _persist_aws_queue_url(profile: str, queue_url: str, bucket: str | None = No
         target["region"] = region
     if endpoint:
         target["endpoint"] = endpoint
-    target.setdefault("aws", {})["sqs_queue_url"] = queue_url
-    _write_config(data)
+    aws = target.get("aws")
+    if aws is None:
+        aws = {}
+        target["aws"] = aws
+    elif not isinstance(aws, dict):
+        raise click.ClickException(
+            f"Configuration profile '{profile_name}' has an invalid AWS section"
+        )
+    aws["sqs_queue_url"] = queue_url
+    _write_config(data, config_path)
 
 
 def _echo_json(payload: dict | list) -> None:
@@ -218,7 +280,7 @@ class _DeprecatedDatasetAlias(click.Command):
 
 @click.group()
 @click.version_option(__version__)
-@click.option("--profile", default=lambda: os.environ.get("DSIMAGING_PROFILE", "default"),
+@click.option("--profile", default=lambda: os.environ.get("DSIMAGING_PROFILE"),
               help="Configuration profile in ~/.dsimaging.yaml")
 @click.option("--endpoint", default=None, help="S3/MinIO endpoint URL")
 @click.option("--access-key", default=None, help="S3 access key")
@@ -239,7 +301,7 @@ class _DeprecatedDatasetAlias(click.Command):
 def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
          controller_url, controller_token, skip_controller, backend):
     """Admin CLI for managing dsimaging-store deployments and datasets."""
-    cfg = _load_config(profile)
+    profile, cfg = _load_profile(profile)
     backend = _resolve_backend(backend, cfg)
     # A stored profile endpoint applies only to store backends (auto/minio/
     # s3-compatible); when AWS is requested, only an explicit CLI flag or
@@ -249,6 +311,12 @@ def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
                                      "endpoint")
     endpoint = raw_endpoint or ("" if backend == "aws" else "http://127.0.0.1:9000")
     resolved_backend, backend_rationale = detect_backend(endpoint or None, backend)
+    if (resolved_backend == "aws" and raw_endpoint and
+            not is_native_aws_s3_endpoint(raw_endpoint)):
+        raise click.ClickException(
+            "AWS mode accepts only a native HTTPS S3 endpoint; "
+            "omit --endpoint to use the AWS SDK default"
+        )
     if resolved_backend == "aws":
         access_key = _resolve_optional(access_key, "DSIMAGING_ACCESS_KEY", cfg, "access_key")
         secret_key = _resolve_optional(secret_key, "DSIMAGING_SECRET_KEY", cfg, "secret_key")
@@ -388,10 +456,18 @@ def store_init(ctx, path, force, controller_image, store_source, backend, kms_ke
     backend_override = backend or ctx.obj.get("backend") or "auto"
     resolved_backend, rationale = detect_backend(ctx.obj.get("endpoint") or None,
                                                  backend_override)
+    if resolved_backend == "s3-compatible":
+        raise click.ClickException(
+            "an existing S3-compatible endpoint is connect-only; "
+            "configure a profile and run 'dsimaging-admin doctor'"
+        )
     if resolved_backend == "aws":
         aws_endpoint = ctx.obj.get("endpoint") or None
-        if aws_endpoint and "amazonaws.com" not in aws_endpoint.lower():
-            aws_endpoint = None
+        if aws_endpoint and not is_native_aws_s3_endpoint(aws_endpoint):
+            raise click.ClickException(
+                "AWS provisioning accepts only a native HTTPS S3 endpoint; "
+                "omit --endpoint to use the AWS SDK default"
+            )
         try:
             report = provision_aws_store(
                 aws_endpoint,
@@ -504,7 +580,10 @@ def store_config(path, output):
     click.echo(f"S3 endpoint:    {cfg.endpoint}")
     click.echo(f"Controller URL: {cfg.controller_url}")
     click.echo(f"Bucket:         {cfg.bucket}")
-    click.echo(f"Access key:     {cfg.access_key}")
+    click.echo(
+        "Credentials:    "
+        f"{'configured (not shown)' if cfg.access_key and cfg.secret_key else 'missing'}"
+    )
 
 
 @store_group.command("doctor")

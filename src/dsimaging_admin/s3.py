@@ -9,14 +9,42 @@ from botocore.config import Config
 from urllib.parse import urlparse
 
 
+def is_native_aws_s3_endpoint(endpoint: str | None) -> bool:
+    """Return whether *endpoint* is a credential-free native AWS S3 URL."""
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        return False
+    try:
+        parsed = urlparse(endpoint.strip())
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.path not in ("", "/")
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    host = parsed.hostname.lower().rstrip(".")
+    return re.search(
+        r"(?:^|\.)s3(?:[.-][a-z0-9-]+)*\.amazonaws\.com(?:\.cn)?$",
+        host,
+    ) is not None
+
+
 def detect_backend(endpoint: str | None, override: str = "auto") -> tuple[str, str]:
     """Return ``(backend, rationale)`` for an endpoint and optional override."""
     if override and override != "auto":
         return override, f"explicit override: {override}"
     endpoint = (endpoint or "").strip()
     lower = endpoint.lower()
-    if not lower or "amazonaws.com" in lower:
-        return "aws", "empty endpoint or amazonaws.com uses native AWS S3"
+    if not lower or is_native_aws_s3_endpoint(endpoint):
+        return "aws", "empty endpoint or native AWS S3 host"
     if (
         "minio" in lower
         or lower.startswith("http://127.0.0.1")

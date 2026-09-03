@@ -1,5 +1,20 @@
 # NEWS
 
+## 0.3.12
+
+- Configuration now honors `default_profile` when no explicit profile or
+  environment override is supplied, and invalid YAML or unknown profiles fail
+  before any storage client is created.
+- `store init` rejects existing S3-compatible endpoints instead of generating
+  an unrelated local MinIO project. AWS provisioning accepts only native HTTPS
+  S3 hostnames, preventing lookalike endpoints from entering that path.
+- Store status/configuration output reports whether credentials are configured
+  without printing access keys, secret keys, or controller/webhook tokens.
+- The operator UI uses the complete shared AWS/SQS provisioner, reports storage
+  access failures distinctly from an empty inventory, and rejects invalid
+  profile files instead of silently selecting localhost. AWS queue details are
+  saved back to the selected profile for subsequent health checks.
+
 ## 0.3.11
 
 - JSON health and dataset-status commands now preserve machine-readable output

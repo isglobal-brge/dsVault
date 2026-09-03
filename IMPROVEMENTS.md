@@ -3,6 +3,9 @@
 Validated status after the `dsimaging-admin` / `dsimaging-store` work for
 store-centric administration.
 
+The proposed simplified operator experience is tracked in
+[`UX_ROADMAP.md`](UX_ROADMAP.md).
+
 ## Product boundary
 
 `dsimaging-admin` manages `dsimaging-store` deployments and the datasets inside
@@ -71,7 +74,8 @@ images, masks, metadata and manifests.
 ## Explicitly not implemented
 
 - Opal commands and `--opal-*` flags, by product decision.
-- A web UI; the CLI plus MinIO console remains the operating surface.
+- Remote exposure or authentication for the local operator UI; it remains
+  loopback-only by design.
 - Image-level processing such as DICOM de-identification, resampling or format
   conversion. Those belong in imaging/radiomics pipelines, not store admin.
 

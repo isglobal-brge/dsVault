@@ -37,6 +37,89 @@ class FakeBody(io.BytesIO):
     pass
 
 
+@unittest.skipUnless(HAS_STREAMLIT, "streamlit testing extra is not installed")
+class UIHelperTests(unittest.TestCase):
+    def test_dataset_listing_failure_is_not_an_empty_inventory(self):
+        import dsimaging_admin.ui as ui
+
+        with patch.object(ui, "dataset_rows", side_effect=RuntimeError("private")), \
+                patch.object(ui.st, "error") as error, \
+                patch.object(ui.st, "info") as info:
+            rows = ui.safe_dataset_rows(object(), "imaging-data")
+
+        self.assertIsNone(rows)
+        self.assertNotIn("private", str(error.call_args))
+        self.assertIn("Doctor", str(info.call_args))
+
+    def test_aws_init_uses_complete_shared_provisioner(self):
+        import dsimaging_admin.ui as ui
+
+        report = {"ok": True, "steps": []}
+        config = {
+            "endpoint": "", "bucket": "imaging-data", "region": "eu-west-1",
+            "access_key": "access", "secret_key": "secret",
+        }
+        with patch.object(ui, "provision_aws_store", return_value=report) as provision:
+            observed = ui.init_aws_store(config, "kms-arn")
+
+        self.assertIs(observed, report)
+        provision.assert_called_once_with(
+            None, "imaging-data", region="eu-west-1",
+            access_key="access", secret_key="secret", kms_key="kms-arn",
+        )
+
+    def test_aws_init_rejects_non_aws_and_insecure_endpoints(self):
+        import dsimaging_admin.ui as ui
+
+        for endpoint in (
+            "https://s3.amazonaws.com.attacker.invalid",
+            "http://s3.eu-west-1.amazonaws.com",
+        ):
+            with self.subTest(endpoint=endpoint), self.assertRaisesRegex(
+                    ValueError, "native HTTPS S3 endpoint"):
+                ui.init_aws_store({
+                    "endpoint": endpoint,
+                    "bucket": "imaging-data",
+                    "region": "eu-west-1",
+                }, "")
+
+    def test_invalid_profile_file_fails_closed(self):
+        import dsimaging_admin.ui as ui
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "config.yaml")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("profiles: [broken\n")
+            with self.assertRaisesRegex(ValueError, "Could not read"):
+                ui.load_profiles(path)
+
+    def test_empty_profiles_file_fails_closed(self):
+        import dsimaging_admin.ui as ui
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "config.yaml")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("profiles: {}\n")
+            with self.assertRaisesRegex(ValueError, "defines no profiles"):
+                ui.load_profiles(path)
+
+    def test_invalid_aws_profile_section_fails_closed(self):
+        import dsimaging_admin.ui as ui
+
+        fixtures = (
+            "profiles:\n  default:\n    aws: invalid\n",
+            "default:\n  aws: invalid\n",
+            "aws: invalid\n",
+        )
+        for content in fixtures:
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as tmpdir:
+                path = os.path.join(tmpdir, "config.yaml")
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(content)
+                with self.assertRaisesRegex(ValueError, "AWS profile section"):
+                    ui.load_profiles(path)
+
+
 class FakePaginator:
     def __init__(self, objects):
         self.objects = objects

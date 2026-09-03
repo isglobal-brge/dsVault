@@ -226,8 +226,11 @@ class AdminFeatureTests(unittest.TestCase):
         self.assertTrue(cfg.webhook_token)
         self.assertEqual(cfg.controller_token, loaded.controller_token)
         self.assertEqual(cfg.webhook_token, loaded.webhook_token)
+        self.assertNotIn("access_key", cfg.to_dict())
+        self.assertNotIn("secret_key", cfg.to_dict())
         self.assertNotIn("controller_token", cfg.to_dict())
         self.assertNotIn("webhook_token", cfg.to_dict())
+        self.assertEqual(cfg.to_dict()["credentials"], "configured")
         self.assertEqual(env_mode, 0o600)
         self.assertIn("example/dsimaging-store-controller:test", env)
         self.assertIn("DSIMAGING_CONTROLLER_TOKEN=", env)
@@ -376,6 +379,54 @@ class AdminFeatureTests(unittest.TestCase):
             with open(os.path.join(tmpdir, ".env"), encoding="utf-8") as f:
                 env = f.read()
         self.assertIn("MINIO_PORT=9200", env)
+
+    def test_cli_store_init_rejects_s3_compatible_endpoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("dsimaging_admin.cli.init_store") as init_local, \
+                patch("dsimaging_admin.cli.provision_aws_store") as init_aws:
+            result = CliRunner().invoke(main, [
+                "--backend", "s3-compatible",
+                "--endpoint", "https://store.example.org",
+                "store", "init", os.path.join(tmpdir, "store"),
+            ])
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("connect", result.output)
+        init_local.assert_not_called()
+        init_aws.assert_not_called()
+
+    def test_cli_store_init_rejects_deceptive_aws_hostname(self):
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("dsimaging_admin.cli.init_store") as init_local, \
+                patch("dsimaging_admin.cli.provision_aws_store") as init_aws:
+            result = CliRunner().invoke(main, [
+                "--backend", "aws",
+                "--endpoint", "https://s3.amazonaws.com.attacker.invalid",
+                "store", "init", os.path.join(tmpdir, "store"),
+            ])
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("native HTTPS S3 endpoint", result.output)
+        init_local.assert_not_called()
+        init_aws.assert_not_called()
+
+    def test_cli_store_config_never_serializes_credentials(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generated = init_store(tmpdir)
+            missing_config = os.path.join(tmpdir, "missing-config.yaml")
+            with patch("dsimaging_admin.cli.CONFIG_PATH", missing_config):
+                result = CliRunner().invoke(
+                    main, ["store", "config", tmpdir, "--output", "json"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        payload = json.loads(result.output)
+        for field in ("access_key", "secret_key", "controller_token",
+                      "webhook_token"):
+            self.assertNotIn(field, payload)
+        self.assertEqual(payload["credentials"], "configured")
+        for value in (generated.access_key, generated.secret_key,
+                      generated.controller_token, generated.webhook_token):
+            self.assertNotIn(value, result.output)
 
     def test_cli_store_init_does_not_reuse_connection_credentials(self):
         with tempfile.TemporaryDirectory() as tmpdir:

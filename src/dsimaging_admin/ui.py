@@ -34,6 +34,7 @@ from dsimaging_admin.cli import (
     _atomic_upload_sources,
     _finish_atomic_publish,
     _partition_uploads,
+    _persist_aws_queue_url,
     _read_manifest_strict,
     _read_existing_samples_metadata,
     _rescan_dataset_artifacts,
@@ -56,9 +57,11 @@ from dsimaging_admin.s3 import (
     delete_object_versions,
     detect_backend,
     get_object_bytes,
+    is_native_aws_s3_endpoint,
     list_datasets,
     list_objects,
     list_object_versions,
+    provision_aws_store,
 )
 from dsimaging_admin.store import (
     DEFAULT_CONTROLLER_IMAGE,
@@ -98,9 +101,17 @@ def run_app() -> None:
     st.title("dsimaging-admin")
     st.caption("Local operator dashboard for dsimaging-store")
 
-    profiles = load_profiles()
-    selected_profile = profile_picker(profiles)
+    try:
+        profiles = load_profiles()
+        selected_profile = profile_picker(profiles)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
     config = edit_connection_config(profiles.get(selected_profile, {}))
+    config["_profile"] = selected_profile
+    config["_config_path"] = (
+        os.environ.get("DSIMAGING_CONFIG") or DEFAULT_CONFIG_PATH
+    )
 
     page = st.sidebar.radio(
         "Navigation",
@@ -150,13 +161,33 @@ def load_profiles(path: str | None = None) -> dict[str, dict]:
     try:
         with open(config_path, encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
-    except Exception:
-        return {"default": {}}
+    except Exception as exc:
+        raise ValueError("Could not read the dsimaging configuration file") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("The dsimaging configuration must contain a mapping")
     st.session_state["_config_default_profile"] = raw.get("default_profile")
     profiles = raw.get("profiles")
     if isinstance(profiles, dict):
+        if not profiles:
+            raise ValueError("The dsimaging configuration defines no profiles")
+        if not all(value is None or isinstance(value, dict)
+                   for value in profiles.values()):
+            raise ValueError("Every dsimaging profile must contain a mapping")
+        if any(
+            value is not None
+            and value.get("aws") is not None
+            and not isinstance(value["aws"], dict)
+            for value in profiles.values()
+        ):
+            raise ValueError("Every AWS profile section must contain a mapping")
         return {str(name): (value or {}) for name, value in profiles.items()}
+    if profiles is not None:
+        raise ValueError("The dsimaging 'profiles' value must be a mapping")
     default = raw.get("default", raw)
+    if not isinstance(default, dict):
+        raise ValueError("The default dsimaging profile must contain a mapping")
+    if default.get("aws") is not None and not isinstance(default["aws"], dict):
+        raise ValueError("Every AWS profile section must contain a mapping")
     return {"default": default or {}}
 
 
@@ -166,6 +197,10 @@ def profile_picker(profiles: dict[str, dict]) -> str:
         os.environ.get("DSIMAGING_PROFILE")
         or st.session_state.get("_config_default_profile")
     )
+    if default_name and default_name not in names:
+        raise ValueError(
+            f"Configured profile '{default_name}' does not exist"
+        )
     index = names.index(default_name) if default_name in names else 0
     return st.sidebar.selectbox("Profile", names, index=index)
 
@@ -312,8 +347,26 @@ def render_store_admin(config: dict) -> None:
         with st.expander("Operation log", expanded=True):
             try:
                 if backend == "aws":
-                    init_aws_store(config | {"bucket": bucket, "region": region}, kms_key)
-                    st.success("AWS bucket checks and defaults applied.")
+                    report = init_aws_store(
+                        config | {"bucket": bucket, "region": region}, kms_key)
+                    st.success("AWS store provisioning complete.")
+                    st.write(report["steps"])
+                    if report.get("sqs_queue_url"):
+                        _persist_aws_queue_url(
+                            config.get("_profile") or "default",
+                            report["sqs_queue_url"],
+                            bucket=bucket,
+                            region=report.get("region") or region,
+                            endpoint=config.get("endpoint") or None,
+                            config_path=config.get("_config_path"),
+                        )
+                        config["sqs_queue_url"] = report["sqs_queue_url"]
+                        st.info("SQS queue URL saved to the selected profile.")
+                elif backend == "s3-compatible":
+                    st.error(
+                        "An existing S3-compatible endpoint is connect-only; "
+                        "configure it and run Doctor instead."
+                    )
                 else:
                     cfg = init_store(
                         project_path,
@@ -455,7 +508,10 @@ def render_modify_rescan(config: dict) -> None:
     st.header("Modify / Rescan")
     s3 = make_s3_client(config)
     bucket = config["bucket"]
-    datasets = [row["dataset_id"] for row in safe_dataset_rows(s3, bucket)]
+    rows = safe_dataset_rows(s3, bucket)
+    if rows is None:
+        return
+    datasets = [row["dataset_id"] for row in rows]
     if not datasets:
         st.info("No datasets found.")
         return
@@ -487,6 +543,8 @@ def render_delete(config: dict) -> None:
     s3 = make_s3_client(config)
     bucket = config["bucket"]
     datasets = safe_dataset_rows(s3, bucket)
+    if datasets is None:
+        return
     if not datasets:
         st.info("No datasets found.")
         return
@@ -544,7 +602,10 @@ def render_controller(config: dict) -> None:
     if config.get("sqs_queue_url"):
         st.subheader("SQS")
         st.json(sqs_depth(config))
-    datasets = [row["dataset_id"] for row in safe_dataset_rows(make_s3_client(config), config["bucket"])]
+    rows = safe_dataset_rows(make_s3_client(config), config["bucket"])
+    if rows is None:
+        return
+    datasets = [row["dataset_id"] for row in rows]
     if datasets:
         selected = st.selectbox("Dataset to reconcile", datasets)
         if st.button("Reconcile dataset"):
@@ -616,11 +677,13 @@ def dataset_rows(s3, bucket: str) -> list[dict]:
     return sorted(rows, key=lambda row: row["last_modified"], reverse=True)
 
 
-def safe_dataset_rows(s3, bucket: str) -> list[dict]:
+def safe_dataset_rows(s3, bucket: str) -> list[dict] | None:
     try:
         return dataset_rows(s3, bucket)
     except Exception:
-        return []
+        st.error("Could not list datasets. Check the connection and credentials.")
+        st.info("Run Connect & Doctor before retrying this operation.")
+        return None
 
 
 def preview_scan(source_path: str) -> dict:
@@ -790,27 +853,21 @@ def rescan_dataset(config: dict, dataset_id: str, extra_metadata=None) -> dict:
     return {"samples": counts["samples"], "masks": counts["masks"]}
 
 
-def init_aws_store(config: dict, kms_key: str) -> None:
-    s3 = make_s3_client(config)
-    bucket = config["bucket"]
-    region = config.get("region") or "us-east-1"
-    try:
-        s3.head_bucket(Bucket=bucket)
-    except Exception:
-        kwargs = {"Bucket": bucket}
-        if region != "us-east-1":
-            kwargs["CreateBucketConfiguration"] = {"LocationConstraint": region}
-        s3.create_bucket(**kwargs)
-    s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
-    encryption = {
-        "Rules": [{
-            "ApplyServerSideEncryptionByDefault": (
-                {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": kms_key}
-                if kms_key else {"SSEAlgorithm": "AES256"}
-            )
-        }]
-    }
-    s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration=encryption)
+def init_aws_store(config: dict, kms_key: str) -> dict:
+    endpoint = config.get("endpoint") or None
+    if endpoint and not is_native_aws_s3_endpoint(endpoint):
+        raise ValueError(
+            "AWS provisioning accepts only a native HTTPS S3 endpoint; "
+            "leave the endpoint empty to use the AWS SDK default"
+        )
+    return provision_aws_store(
+        endpoint,
+        config["bucket"],
+        region=config.get("region") or "us-east-1",
+        access_key=config.get("access_key") or None,
+        secret_key=config.get("secret_key") or None,
+        kms_key=kms_key or None,
+    )
 
 
 def make_s3_client(config: dict):

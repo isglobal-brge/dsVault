@@ -45,9 +45,12 @@ class StoreConfig:
 
     def to_dict(self) -> dict:
         data = asdict(self)
+        configured = bool(self.access_key and self.secret_key)
+        data.pop("access_key", None)
         data.pop("secret_key", None)
         data.pop("controller_token", None)
         data.pop("webhook_token", None)
+        data["credentials"] = "configured" if configured else "missing"
         return data
 
 
