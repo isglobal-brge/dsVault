@@ -23,6 +23,10 @@ PRIVACY_UNIT_CANONICALIZATION = "trim-utf8-v2"
 _ASCII_ID_TRIM = " \t\r\n"
 _MAX_PRIVACY_UNIT_BYTES = 4096
 _MISSING_VALUES = {"na", "nan", "null", "<na>", "nat"}
+_RESOURCE_FIELDS = (
+    "uri", "file", "path", "root", "manifest",
+    "content_hash_index", "hash_index", "index_uri",
+)
 
 
 def validate_dataset_id(dataset_id: str) -> str:
@@ -48,8 +52,11 @@ def scan_images(source_dir: str) -> list[dict]:
 
     for entry in sorted(os.listdir(images_dir)):
         filepath = os.path.join(images_dir, entry)
+        if os.path.islink(filepath):
+            raise ValueError("symbolic links are not allowed in image collections")
 
         if os.path.isfile(filepath) and is_image_file(entry):
+            _validate_relative_asset_path(entry)
             samples.append({
                 "sample_id": sample_id_from_filename(entry),
                 "source_kind": "single_file",
@@ -65,10 +72,15 @@ def scan_images(source_dir: str) -> list[dict]:
                 f for f in os.listdir(filepath) if f.lower().endswith(".dcm")
             )
             if dcm_files:
+                _validate_relative_asset_path(entry)
                 h = hashlib.sha256()
                 total_size = 0
                 for dcm in dcm_files:
                     dcm_path = os.path.join(filepath, dcm)
+                    if os.path.islink(dcm_path):
+                        raise ValueError(
+                            "symbolic links are not allowed in DICOM series")
+                    _validate_relative_asset_path(f"{entry}/{dcm}")
                     h.update(sha256_file(dcm_path).encode())
                     total_size += os.path.getsize(dcm_path)
                 samples.append({
@@ -153,12 +165,17 @@ def scan_masks(source_dir: str, sample_ids: list[str] | None = None) -> list[dic
     if not masks_dir:
         return masks
 
-    for root, _, files in os.walk(masks_dir):
+    for root, directories, files in os.walk(masks_dir):
+        if any(os.path.islink(os.path.join(root, name)) for name in directories):
+            raise ValueError("symbolic links are not allowed in mask collections")
         for entry in sorted(files):
             filepath = os.path.join(root, entry)
             if not os.path.isfile(filepath) or not is_image_file(entry):
                 continue
+            if os.path.islink(filepath):
+                raise ValueError("symbolic links are not allowed in mask collections")
             rel = os.path.relpath(filepath, masks_dir).replace(os.sep, "/")
+            _validate_relative_asset_path(rel)
             masks.append({
                 "sample_id": _sample_id_from_mask_filename(entry, sample_ids),
                 "source_kind": "mask_file",
@@ -197,6 +214,7 @@ def scan_s3_images(s3, bucket: str, prefix: str, objects: list[dict]) -> list[di
         filename = rel.rsplit("/", 1)[-1]
         if not is_image_file(filename):
             continue
+        _validate_relative_asset_path(rel)
         if "/" in rel and filename.lower().endswith(".dcm"):
             sample_id = rel.split("/", 1)[0]
             dicom_groups.setdefault(sample_id, []).append((rel, obj))
@@ -268,6 +286,7 @@ def scan_s3_masks(s3, bucket: str, prefix: str, objects: list[dict],
         filename = rel.rsplit("/", 1)[-1]
         if not is_image_file(filename):
             continue
+        _validate_relative_asset_path(rel)
         content_hash = _sha256_s3_object(s3, bucket, key)
         masks.append({
             "sample_id": _sample_id_from_mask_filename(filename, sample_ids),
@@ -315,14 +334,11 @@ def generate_manifest(dataset_id: str, bucket: str, prefix: str,
         "uri": f"s3://{bucket}/{prefix}/source/images/",
         "kind": "image_root",
     }
-    metadata = deepcopy(manifest.get("metadata")) if isinstance(manifest.get("metadata"), dict) else {}
-    metadata.update({
+    metadata = {
         "uri": f"s3://{bucket}/{prefix}/metadata/samples.parquet",
         "format": "parquet",
         **contract,
-    })
-    if label_col is None:
-        metadata.pop("label_col", None)
+    }
     manifest["assets"] = assets
     manifest["metadata"] = metadata
     if has_masks:
@@ -336,6 +352,7 @@ def generate_manifest(dataset_id: str, bucket: str, prefix: str,
         }
     else:
         assets.pop(mask_asset, None)
+    validate_manifest_scope(manifest, bucket, prefix)
     return manifest
 
 
@@ -382,6 +399,111 @@ def metadata_contract_from_manifest(manifest: dict) -> dict:
     return metadata_contract(
         metadata.get("privacy_unit_col"), metadata.get("label_col")
     )
+
+
+def validate_manifest_scope(manifest: dict, bucket: str, prefix: str) -> None:
+    """Require every store manifest reference to stay in one collection."""
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be a mapping")
+    dataset_id = validate_dataset_id(manifest.get("dataset_id"))
+    prefix = (prefix or "").rstrip("/")
+    if prefix != f"datasets/{dataset_id}":
+        raise ValueError("manifest dataset_id does not match its collection prefix")
+    if not isinstance(bucket, str) or not bucket:
+        raise ValueError("manifest bucket must be non-empty")
+    if (not isinstance(manifest.get("schema_version"), int) or
+            isinstance(manifest.get("schema_version"), bool) or
+            manifest.get("schema_version") != 1):
+        raise ValueError("manifest schema_version must be 1")
+
+    root = f"s3://{bucket}/{prefix}"
+    expected = {
+        "content_hash_index": (
+            f"{root}/indexes/content_hash_index.parquet", "parquet"),
+        "sample_manifests": (
+            f"{root}/metadata/sample_manifests.parquet", "parquet"),
+        "metadata": (f"{root}/metadata/samples.parquet", "parquet"),
+    }
+    for field, (uri, file_format) in expected.items():
+        value = manifest.get(field)
+        if (not isinstance(value, dict) or value.get("uri") != uri or
+                value.get("format") != file_format):
+            raise ValueError(f"manifest {field} does not use its canonical collection URI")
+        _reject_conflicting_resource_aliases(value, uri, field)
+
+    assets = manifest.get("assets")
+    images = assets.get("images") if isinstance(assets, dict) else None
+    if (not isinstance(images, dict) or
+            images.get("uri") != f"{root}/source/images/" or
+            images.get("kind") != "image_root"):
+        raise ValueError("manifest images asset is not the canonical collection root")
+    _reject_conflicting_resource_aliases(
+        images, f"{root}/source/images/", "images asset")
+    masks = assets.get("masks")
+    if masks is not None and (
+            not isinstance(masks, dict) or
+            masks.get("uri") != f"{root}/source/masks/" or
+            masks.get("kind") != "mask_root" or
+            masks.get("content_hash_index") !=
+            f"{root}/indexes/masks_content_hash_index.parquet"):
+        raise ValueError("manifest masks asset is not the canonical collection root")
+    if masks is not None:
+        _reject_conflicting_resource_aliases(
+            masks, f"{root}/source/masks/", "masks asset")
+
+    metadata_contract_from_manifest(manifest)
+    references = []
+    for value in (manifest.get("metadata"), manifest.get("content_hash_index"),
+                  manifest.get("sample_manifests")):
+        references.extend(_manifest_resource_references(value))
+    for asset in assets.values():
+        if not isinstance(asset, dict):
+            raise ValueError("manifest assets must be mappings")
+        references.extend(_manifest_resource_references(asset))
+    labels = manifest.get("labels") or []
+    if isinstance(labels, dict):
+        labels = labels.values()
+    elif not isinstance(labels, list):
+        raise ValueError("manifest labels must be a list or mapping")
+    for label in labels:
+        if not isinstance(label, dict):
+            raise ValueError("manifest labels must contain mappings")
+        references.extend(_manifest_resource_references(label))
+    for uri in references:
+        if not _uri_within_collection(uri, root):
+            raise ValueError("manifest references data outside its collection prefix")
+
+
+def _manifest_resource_references(value) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    references = []
+    for field in _RESOURCE_FIELDS:
+        candidate = value.get(field)
+        if candidate is None:
+            continue
+        if isinstance(candidate, dict):
+            candidate = candidate.get("uri")
+        if not isinstance(candidate, str) or not candidate:
+            raise ValueError(f"manifest resource field {field} must be a URI")
+        references.append(candidate)
+    return references
+
+
+def _reject_conflicting_resource_aliases(value: dict, uri: str,
+                                         field: str) -> None:
+    for alias in ("file", "path", "root", "manifest"):
+        candidate = value.get(alias)
+        if candidate is not None and candidate != uri:
+            raise ValueError(f"manifest {field} has a conflicting resource alias")
+
+
+def _uri_within_collection(uri: str, root: str) -> bool:
+    if any(char in uri for char in ("\\", "\r", "\n")):
+        return False
+    if uri != root and not uri.startswith(f"{root}/"):
+        return False
+    return not any(part in {".", ".."} for part in uri.split("/"))
 
 
 def write_manifest_yaml(manifest: dict, path: str):
@@ -650,6 +772,8 @@ def _find_images_dir(source_dir: str) -> str | None:
     """Find the directory containing image files."""
     for candidate in ["images", "source/images", "."]:
         d = os.path.join(source_dir, candidate)
+        if os.path.islink(d):
+            raise ValueError("symbolic links are not allowed for the image root")
         if os.path.isdir(d) and _contains_supported_images(d):
             return d
     return None
@@ -659,6 +783,8 @@ def _find_masks_dir(source_dir: str) -> str | None:
     """Find the directory containing mask files."""
     for candidate in ["masks", "source/masks", "labels", "source/labels"]:
         d = os.path.join(source_dir, candidate)
+        if os.path.islink(d):
+            raise ValueError("symbolic links are not allowed for the mask root")
         if os.path.isdir(d) and _contains_supported_masks(d):
             return d
     return None
@@ -667,6 +793,8 @@ def _find_masks_dir(source_dir: str) -> str | None:
 def _contains_supported_images(directory: str) -> bool:
     for entry in os.listdir(directory):
         path = os.path.join(directory, entry)
+        if os.path.islink(path):
+            raise ValueError("symbolic links are not allowed in image collections")
         if os.path.isfile(path) and is_image_file(entry):
             return True
         if os.path.isdir(path):
@@ -676,10 +804,23 @@ def _contains_supported_images(directory: str) -> bool:
 
 
 def _contains_supported_masks(directory: str) -> bool:
-    for _, _, files in os.walk(directory):
+    for root, directories, files in os.walk(directory):
+        if any(os.path.islink(os.path.join(root, name)) for name in directories):
+            raise ValueError("symbolic links are not allowed in mask collections")
+        if any(os.path.islink(os.path.join(root, name)) for name in files):
+            raise ValueError("symbolic links are not allowed in mask collections")
         if any(is_image_file(f) for f in files):
             return True
     return False
+
+
+def _validate_relative_asset_path(path: str) -> None:
+    if (not isinstance(path, str) or not path or path.startswith("/") or
+            any(char in path for char in ("\\", "\r", "\n"))):
+        raise ValueError("collection asset path is invalid")
+    if (len(path.encode("utf-8", errors="strict")) > 4096 or
+            any(part in {"", ".", ".."} for part in path.split("/"))):
+        raise ValueError("collection asset path is invalid")
 
 
 def _sample_id_from_mask_filename(filename: str,

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -13,9 +15,18 @@ from .controller import ControllerError, health
 from .s3 import create_client
 
 
-DEFAULT_CONTROLLER_IMAGE = "davidsarratgonzalez/dsimaging-store:latest"
-DEFAULT_MINIO_IMAGE = "minio/minio:latest"
-DEFAULT_MC_IMAGE = "minio/mc:latest"
+DEFAULT_CONTROLLER_IMAGE = (
+    "davidsarratgonzalez/dsimaging-store:0.3.5@"
+    "sha256:0766d57e3ae3978ac98e77d33d99d2c9d151c1cd3553580e85a18b52485f85cb"
+)
+DEFAULT_MINIO_IMAGE = (
+    "minio/minio:RELEASE.2025-09-07T16-13-09Z@"
+    "sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+)
+DEFAULT_MC_IMAGE = (
+    "minio/mc:RELEASE.2025-08-13T08-35-41Z@"
+    "sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
+)
 
 
 @dataclass
@@ -46,8 +57,8 @@ def init_store(
     store_source: str | None = None,
     minio_image: str = DEFAULT_MINIO_IMAGE,
     mc_image: str = DEFAULT_MC_IMAGE,
-    access_key: str = "minioadmin",
-    secret_key: str = "minioadmin123",
+    access_key: str | None = None,
+    secret_key: str | None = None,
     bucket: str = "imaging-data",
     minio_port: int = 9000,
     console_port: int = 9001,
@@ -64,8 +75,44 @@ def init_store(
         names = ", ".join(path.name for path in existing)
         raise FileExistsError(f"{root} already contains generated store files: {names}")
 
+    previous_env = _read_env(root / ".env") if force else {}
+    access_key = (
+        access_key or previous_env.get("MINIO_ROOT_USER") or
+        f"dsimg{secrets.token_hex(12)}"
+    )
+    secret_key = (
+        secret_key or previous_env.get("MINIO_ROOT_PASSWORD") or
+        secrets.token_urlsafe(32)
+    )
     controller_block = _controller_compose_block(controller_image, store_source)
-    controller_token = controller_token or secrets.token_urlsafe(32)
+    controller_token = (
+        controller_token or previous_env.get("DSIMAGING_CONTROLLER_TOKEN") or
+        secrets.token_urlsafe(32)
+    )
+    access_key = _safe_env_value("MinIO access key", access_key, min_length=3)
+    secret_key = _safe_env_value("MinIO secret key", secret_key, min_length=8)
+    controller_token = _safe_env_value(
+        "controller token", controller_token, min_length=16)
+    controller_image = _safe_env_value("controller image", controller_image)
+    minio_image = _safe_env_value("MinIO image", minio_image)
+    mc_image = _safe_env_value("MinIO client image", mc_image)
+    if (not isinstance(bucket, str) or
+            not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket) or
+            ".." in bucket or ".-" in bucket or "-." in bucket):
+        raise ValueError("bucket must be a canonical S3 bucket name")
+    ports = {
+        "MinIO port": minio_port,
+        "MinIO console port": console_port,
+        "controller port": controller_port,
+    }
+    for name, value in ports.items():
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+            raise ValueError(f"{name} must be an integer between 1 and 65535")
+    if len(set(ports.values())) != len(ports):
+        raise ValueError("store service ports must be distinct")
+    if (isinstance(reconcile_interval, bool) or
+            not isinstance(reconcile_interval, int) or reconcile_interval < 1):
+        raise ValueError("reconcile interval must be a positive integer")
     compose = COMPOSE_TEMPLATE.format(
         minio_image=minio_image,
         mc_image=mc_image,
@@ -105,8 +152,8 @@ def load_store_config(path: str) -> StoreConfig:
         controller_url=f"http://127.0.0.1:{controller_port}",
         controller_token=env.get("DSIMAGING_CONTROLLER_TOKEN", ""),
         bucket=env.get("BUCKET_NAME", "imaging-data"),
-        access_key=env.get("MINIO_ROOT_USER", "minioadmin"),
-        secret_key=env.get("MINIO_ROOT_PASSWORD", "minioadmin123"),
+        access_key=env.get("MINIO_ROOT_USER", ""),
+        secret_key=env.get("MINIO_ROOT_PASSWORD", ""),
         minio_port=minio_port,
         console_port=int(env.get("MINIO_CONSOLE_PORT", "9001")),
         controller_port=controller_port,
@@ -198,11 +245,20 @@ def _controller_compose_block(controller_image: str, store_source: str | None) -
             raise FileNotFoundError(f"controller build directory not found: {controller_dir}")
         return f"""\
     build:
-      context: {controller_dir}
+      context: {json.dumps(str(controller_dir))}
 """
     return """\
     image: ${DSIMAGING_STORE_CONTROLLER_IMAGE}
 """
+
+
+def _safe_env_value(name: str, value: str, *, min_length: int = 1) -> str:
+    """Validate an unquoted Compose dotenv value before writing it."""
+    if (not isinstance(value, str) or len(value) < min_length or
+            len(value.encode("utf-8")) > 2048 or value.strip() != value or
+            not re.fullmatch(r"[A-Za-z0-9._~:/+@=-]+", value)):
+        raise ValueError(f"{name} contains characters unsafe for a Compose .env file")
+    return value
 
 
 def _read_env(path: Path) -> dict[str, str]:
@@ -224,11 +280,11 @@ services:
     image: ${{DSIMAGING_STORE_MINIO_IMAGE:-{minio_image}}}
     command: server /data --console-address ":9001"
     ports:
-      - "${{MINIO_PORT:-9000}}:9000"
-      - "${{MINIO_CONSOLE_PORT:-9001}}:9001"
+      - "127.0.0.1:${{MINIO_PORT:-9000}}:9000"
+      - "127.0.0.1:${{MINIO_CONSOLE_PORT:-9001}}:9001"
     environment:
-      MINIO_ROOT_USER: ${{MINIO_ROOT_USER:-minioadmin}}
-      MINIO_ROOT_PASSWORD: ${{MINIO_ROOT_PASSWORD:-minioadmin123}}
+      MINIO_ROOT_USER: ${{MINIO_ROOT_USER:?MINIO_ROOT_USER is required}}
+      MINIO_ROOT_PASSWORD: ${{MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}}
       MINIO_NOTIFY_WEBHOOK_ENABLE_DSIMAGING: "on"
       MINIO_NOTIFY_WEBHOOK_ENDPOINT_DSIMAGING: "http://controller:8080/webhook/minio"
     volumes:
@@ -246,8 +302,8 @@ services:
       - "127.0.0.1:${{CONTROLLER_PORT:-8080}}:8080"
     environment:
       MINIO_ENDPOINT: http://minio:9000
-      MINIO_ROOT_USER: ${{MINIO_ROOT_USER:-minioadmin}}
-      MINIO_ROOT_PASSWORD: ${{MINIO_ROOT_PASSWORD:-minioadmin123}}
+      MINIO_ROOT_USER: ${{MINIO_ROOT_USER:?MINIO_ROOT_USER is required}}
+      MINIO_ROOT_PASSWORD: ${{MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}}
       BUCKET_NAME: ${{BUCKET_NAME:-imaging-data}}
       RECONCILE_INTERVAL_SECONDS: ${{RECONCILE_INTERVAL_SECONDS:-10}}
       DSIMAGING_CONTROLLER_TOKEN: ${{DSIMAGING_CONTROLLER_TOKEN:-}}
@@ -264,8 +320,8 @@ services:
       - ./init-bucket.sh:/init-bucket.sh:ro
     environment:
       MINIO_ENDPOINT: http://minio:9000
-      MINIO_ROOT_USER: ${{MINIO_ROOT_USER:-minioadmin}}
-      MINIO_ROOT_PASSWORD: ${{MINIO_ROOT_PASSWORD:-minioadmin123}}
+      MINIO_ROOT_USER: ${{MINIO_ROOT_USER:?MINIO_ROOT_USER is required}}
+      MINIO_ROOT_PASSWORD: ${{MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}}
       BUCKET_NAME: ${{BUCKET_NAME:-imaging-data}}
       WEBHOOK_RETRIES: ${{WEBHOOK_RETRIES:-12}}
       WEBHOOK_RETRY_SECONDS: ${{WEBHOOK_RETRY_SECONDS:-5}}
@@ -302,8 +358,8 @@ INIT_BUCKET_SCRIPT = """\
 set -e
 
 MINIO_ENDPOINT="${MINIO_ENDPOINT:-http://minio:9000}"
-MINIO_ROOT_USER="${MINIO_ROOT_USER:-minioadmin}"
-MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-minioadmin123}"
+MINIO_ROOT_USER="${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}"
+MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}"
 BUCKET_NAME="${BUCKET_NAME:-imaging-data}"
 WEBHOOK_RETRIES="${WEBHOOK_RETRIES:-12}"
 WEBHOOK_RETRY_SECONDS="${WEBHOOK_RETRY_SECONDS:-5}"
@@ -324,15 +380,15 @@ mc cp /tmp/dsimaging-init/.keep "local/${BUCKET_NAME}/datasets/.keep" 2>/dev/nul
 configure_webhook() {
   attempt=1
   while [ "${attempt}" -le "${WEBHOOK_RETRIES}" ]; do
+    # `mc event add` is not idempotent for an overlapping filter. Remove only
+    # this controller target first; other bucket notification targets remain.
+    mc event remove "local/${BUCKET_NAME}" arn:minio:sqs::DSIMAGING:webhook \
+      --event put,delete --prefix "datasets/" \
+      >/dev/null 2>&1 || true
     if output=$(mc event add "local/${BUCKET_NAME}" arn:minio:sqs::DSIMAGING:webhook \
       --event put,delete \
       --prefix "datasets/" 2>&1); then
       echo "[init] Webhook notification configured"
-      return 0
-    fi
-
-    if echo "${output}" | grep -qi "already"; then
-      echo "[init] Webhook notification already configured"
       return 0
     fi
 

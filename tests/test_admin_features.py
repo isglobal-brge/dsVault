@@ -18,7 +18,13 @@ from dsimaging_admin.manifest import (
     build_samples_metadata,
     generate_manifest,
 )
-from dsimaging_admin.store import init_store, load_store_config
+from dsimaging_admin.store import (
+    DEFAULT_CONTROLLER_IMAGE,
+    DEFAULT_MC_IMAGE,
+    DEFAULT_MINIO_IMAGE,
+    init_store,
+    load_store_config,
+)
 from dsimaging_admin.verify import verify_dataset
 
 
@@ -110,6 +116,10 @@ def publication_artifacts(bucket, prefix, samples, now):
 
 
 class AdminFeatureTests(unittest.TestCase):
+    def test_verify_dataset_rejects_noncanonical_dataset_id(self):
+        with self.assertRaisesRegex(ValueError, "dataset_id must match"):
+            verify_dataset(FakeS3({}), "imaging-data", "../other")
+
     def test_store_init_generates_compose_project(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = init_store(
@@ -124,9 +134,14 @@ class AdminFeatureTests(unittest.TestCase):
                 env = f.read()
             env_mode = stat.S_IMODE(
                 os.stat(os.path.join(tmpdir, ".env")).st_mode)
+            with open(os.path.join(tmpdir, "init-bucket.sh"), encoding="utf-8") as f:
+                init_script = f.read()
 
         self.assertEqual(cfg.bucket, "custom-bucket")
         self.assertEqual(loaded.bucket, "custom-bucket")
+        self.assertTrue(cfg.access_key.startswith("dsimg"))
+        self.assertNotEqual(cfg.access_key, "minioadmin")
+        self.assertNotEqual(cfg.secret_key, "minioadmin123")
         self.assertTrue(cfg.controller_token)
         self.assertEqual(cfg.controller_token, loaded.controller_token)
         self.assertNotIn("controller_token", cfg.to_dict())
@@ -134,9 +149,22 @@ class AdminFeatureTests(unittest.TestCase):
         self.assertIn("example/dsimaging-store-controller:test", env)
         self.assertIn("DSIMAGING_CONTROLLER_TOKEN=", env)
         self.assertIn("DSIMAGING_CONTROLLER_TOKEN", compose)
+        self.assertIn('127.0.0.1:${MINIO_PORT:-9000}:9000', compose)
+        self.assertIn(
+            '127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001', compose)
         self.assertIn('127.0.0.1:${CONTROLLER_PORT:-8080}:8080', compose)
         self.assertIn("controller", compose)
         self.assertIn("minio", compose)
+        self.assertIn("mc event remove", init_script)
+        self.assertNotIn("grep -qi", init_script)
+
+    def test_store_default_images_are_versioned_and_digest_pinned(self):
+        for image in (
+                DEFAULT_CONTROLLER_IMAGE, DEFAULT_MINIO_IMAGE,
+                DEFAULT_MC_IMAGE):
+            with self.subTest(image=image):
+                self.assertNotIn(":latest", image)
+                self.assertRegex(image, r":[^@]+@sha256:[0-9a-f]{64}$")
 
     def test_store_init_can_use_local_store_source(self):
         with tempfile.TemporaryDirectory() as tmpdir, tempfile.TemporaryDirectory() as source:
@@ -147,6 +175,36 @@ class AdminFeatureTests(unittest.TestCase):
 
         self.assertIn("build:", compose)
         self.assertIn("/controller", compose)
+
+    def test_store_force_init_preserves_generated_credentials(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = init_store(tmpdir)
+            second = init_store(tmpdir, force=True)
+
+        self.assertEqual(second.access_key, first.access_key)
+        self.assertEqual(second.secret_key, first.secret_key)
+        self.assertEqual(second.controller_token, first.controller_token)
+
+    def test_store_init_rejects_dotenv_injection_and_invalid_ports(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(ValueError, "unsafe for a Compose"):
+                init_store(tmpdir, access_key="valid\nINJECTED=value")
+            with self.assertRaisesRegex(ValueError, "ports must be distinct"):
+                init_store(tmpdir, minio_port=9000, console_port=9000)
+
+    def test_store_source_path_is_quoted_in_generated_yaml(self):
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                tempfile.TemporaryDirectory(prefix="store source: ") as source:
+            os.makedirs(os.path.join(source, "controller"))
+            init_store(tmpdir, store_source=source)
+            with open(os.path.join(tmpdir, "docker-compose.yml"),
+                      encoding="utf-8") as handle:
+                compose = yaml.safe_load(handle)
+
+        self.assertEqual(
+            compose["services"]["controller"]["build"]["context"],
+            os.path.join(os.path.realpath(source), "controller"),
+        )
 
     def test_cli_store_init_requires_explicit_path(self):
         runner = CliRunner()
@@ -323,6 +381,71 @@ class AdminFeatureTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertTrue(any(
             "publication contract" in issue.detail for issue in result.issues))
+
+    def test_verify_rejects_cross_collection_and_manifest_index_drift(self):
+        bucket = "imaging-data"
+        prefix = "datasets/study_ct_v1"
+        payload = b"image"
+        sample = {
+            "sample_id": "case001", "source_kind": "single_file",
+            "primary_filename": "case001.nii.gz",
+            "uri_path": "case001.nii.gz",
+            "files": [{"path": "case001.nii.gz", "role": "primary"}],
+            "content_hash": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+        }
+        now = dt.datetime(2026, 5, 13, tzinfo=dt.timezone.utc)
+
+        for corruption in (
+                "manifest-root", "index-uri", "manifest-hash", "index-size",
+                "publish-lock"):
+            with self.subTest(corruption=corruption):
+                objects = publication_artifacts(
+                    bucket, prefix, [sample], now)
+                objects[f"{prefix}/source/images/case001.nii.gz"] = {
+                    "body": payload, "last_modified": now,
+                }
+                index = build_hash_index([sample], bucket, prefix)
+                if corruption == "manifest-root":
+                    manifest = yaml.safe_load(
+                        objects[f"{prefix}/manifest.yaml"]["body"])
+                    manifest["assets"]["images"]["uri"] = (
+                        "s3://imaging-data/datasets/other/source/images/")
+                    objects[f"{prefix}/manifest.yaml"]["body"] = (
+                        yaml.safe_dump(manifest).encode("utf-8"))
+                elif corruption == "index-uri":
+                    index = index.set_column(
+                        index.column_names.index("uri"), "uri",
+                        pa.array([
+                            "s3://imaging-data/datasets/other/source/images/"
+                            "case001.nii.gz"
+                        ]),
+                    )
+                elif corruption == "index-size":
+                    index = index.set_column(
+                        index.column_names.index("size"), "size",
+                        pa.array([len(payload) + 1], type=pa.int64()),
+                    )
+                elif corruption == "publish-lock":
+                    objects[f"{prefix}/.publish-lock"] = {
+                        "body": b'{"owner":"active"}', "last_modified": now,
+                    }
+                else:
+                    bad_sample = {**sample, "content_hash": "0" * 64}
+                    objects[
+                        f"{prefix}/metadata/sample_manifests.parquet"
+                    ]["body"] = parquet_bytes(
+                        build_sample_manifests([bad_sample]))
+                objects[f"{prefix}/indexes/content_hash_index.parquet"] = {
+                    "body": parquet_bytes(index), "last_modified": now,
+                }
+
+                result = verify_dataset(
+                    FakeS3(objects), bucket, "study_ct_v1")
+
+                self.assertFalse(result.ok)
+                self.assertTrue(any(
+                    issue.issue == "mismatch" for issue in result.issues))
 
     def test_verify_fraction_does_not_report_unselected_rows_as_extra(self):
         bucket = "imaging-data"

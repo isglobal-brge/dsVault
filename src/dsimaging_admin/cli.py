@@ -41,6 +41,7 @@ from .manifest import (
     scan_s3_masks,
     validate_dataset_id,
     validate_dicom_series,
+    validate_manifest_scope,
     write_manifest_yaml,
 )
 from .store import (
@@ -221,6 +222,16 @@ def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
          controller_url, controller_token, skip_controller, backend):
     """Admin CLI for managing dsimaging-store deployments and datasets."""
     cfg = _load_config(profile)
+    access_key_configured = (
+        access_key not in (None, "") or
+        bool(os.environ.get("DSIMAGING_ACCESS_KEY")) or
+        cfg.get("access_key") not in (None, "")
+    )
+    secret_key_configured = (
+        secret_key not in (None, "") or
+        bool(os.environ.get("DSIMAGING_SECRET_KEY")) or
+        cfg.get("secret_key") not in (None, "")
+    )
     backend = _resolve_backend(backend, cfg)
     # A stored profile endpoint applies only to store backends (auto/minio/
     # s3-compatible); when AWS is requested, only an explicit CLI flag or
@@ -234,10 +245,10 @@ def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
         access_key = _resolve_optional(access_key, "DSIMAGING_ACCESS_KEY", cfg, "access_key")
         secret_key = _resolve_optional(secret_key, "DSIMAGING_SECRET_KEY", cfg, "secret_key")
     else:
-        access_key = _resolve(access_key, "DSIMAGING_ACCESS_KEY", cfg, "access_key",
-                              "minioadmin")
-        secret_key = _resolve(secret_key, "DSIMAGING_SECRET_KEY", cfg, "secret_key",
-                              "minioadmin123")
+        access_key = _resolve_optional(
+            access_key, "DSIMAGING_ACCESS_KEY", cfg, "access_key")
+        secret_key = _resolve_optional(
+            secret_key, "DSIMAGING_SECRET_KEY", cfg, "secret_key")
     bucket = _resolve(bucket, "DSIMAGING_BUCKET", cfg, "bucket", "imaging-data")
     region = _resolve(region, "DSIMAGING_REGION", cfg, "region", "")
     controller_url = _resolve(controller_url, "DSIMAGING_CONTROLLER_URL", cfg,
@@ -252,6 +263,8 @@ def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
     ctx.obj["endpoint"] = endpoint
     ctx.obj["access_key"] = access_key
     ctx.obj["secret_key"] = secret_key
+    ctx.obj["access_key_configured"] = access_key_configured
+    ctx.obj["secret_key_configured"] = secret_key_configured
     ctx.obj["region"] = region
     ctx.obj["backend"] = resolved_backend
     ctx.obj["backend_rationale"] = backend_rationale
@@ -265,8 +278,9 @@ def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
 @click.option("--profile", default="default", help="Profile name to write")
 @click.option("--endpoint", prompt="S3/MinIO endpoint", default="http://127.0.0.1:9000")
 @click.option("--bucket", prompt="Bucket name", default="imaging-data")
-@click.option("--access-key", prompt="Access key", default="minioadmin")
-@click.option("--secret-key", prompt="Secret key", hide_input=True, default="minioadmin123")
+@click.option("--access-key", prompt="Access key")
+@click.option("--secret-key", prompt="Secret key", hide_input=True,
+              confirmation_prompt=True)
 @click.option("--region", prompt="Region (empty for MinIO)", default="")
 @click.option("--controller-url", prompt="Controller URL", default="http://127.0.0.1:8080")
 @click.option("--set-default/--no-set-default", default=True,
@@ -403,8 +417,10 @@ def store_init(ctx, path, force, controller_image, store_source, backend, kms_ke
             click.echo(f"  SQS queue URL saved to {CONFIG_PATH}")
         return
 
-    access_key = access_key or ctx.obj.get("access_key") or "minioadmin"
-    secret_key = secret_key or ctx.obj.get("secret_key") or "minioadmin123"
+    access_key = access_key or (
+        ctx.obj.get("access_key") if ctx.obj.get("access_key_configured") else None)
+    secret_key = secret_key or (
+        ctx.obj.get("secret_key") if ctx.obj.get("secret_key_configured") else None)
     if minio_port is None:
         minio_port = _local_endpoint_port(ctx.obj.get("endpoint")) or 9000
     try:
@@ -811,11 +827,16 @@ def download(ctx, dataset_id, dest, overwrite):
     if not objects:
         raise click.ClickException("dataset has no objects")
     root = Path(dest).expanduser().resolve()
-    for obj in objects:
-        rel = obj["key"][len(prefix):]
-        target = root / rel
-        if target.exists() and not overwrite:
-            raise click.ClickException(f"Refusing to overwrite {target}; use --overwrite")
+    targets = [
+        (obj, _safe_download_target(root, obj["key"][len(prefix):]))
+        for obj in objects
+    ]
+    if not overwrite:
+        existing = next((target for _, target in targets if target.exists()), None)
+        if existing is not None:
+            raise click.ClickException(
+                f"Refusing to overwrite {existing}; use --overwrite")
+    for obj, target in targets:
         target.parent.mkdir(parents=True, exist_ok=True)
         s3.download_file(bucket, obj["key"], str(target))
     click.echo(click.style(f"Downloaded {len(objects)} object(s) to {root}", fg="green"))
@@ -1113,6 +1134,20 @@ def _validate_dataset_cli(dataset_id: str) -> None:
         validate_dataset_id(dataset_id)
     except ValueError as e:
         raise click.ClickException(str(e)) from e
+
+
+def _safe_download_target(root: Path, relative: str) -> Path:
+    if (not relative or relative.startswith("/") or
+            any(char in relative for char in ("\\", "\r", "\n")) or
+            any(part in {"", ".", ".."} for part in relative.split("/"))):
+        raise click.ClickException("dataset contains an unsafe object path")
+    target = (root / relative).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise click.ClickException(
+            "dataset contains an unsafe object path") from exc
+    return target
 
 
 def _rescan_dataset_artifacts(s3, bucket: str, dataset_id: str,
@@ -1483,6 +1518,7 @@ def _read_manifest_strict(s3, bucket: str, prefix: str) -> dict:
         raise ValueError("dataset manifest is corrupt") from exc
     if not isinstance(manifest, dict):
         raise ValueError("dataset manifest must be a mapping")
+    validate_manifest_scope(manifest, bucket, prefix)
     return manifest
 
 

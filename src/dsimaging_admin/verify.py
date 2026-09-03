@@ -12,7 +12,12 @@ import pyarrow.parquet as pq
 import yaml
 
 from .hashing import is_image_file
-from .manifest import metadata_contract_from_manifest, validate_samples_metadata
+from .manifest import (
+    metadata_contract_from_manifest,
+    validate_dataset_id,
+    validate_manifest_scope,
+    validate_samples_metadata,
+)
 from .s3 import get_object_bytes, head_object, list_objects, parse_s3_uri
 
 
@@ -49,6 +54,7 @@ def verify_dataset(s3, bucket: str, dataset_id: str,
                    sample_fraction: float = 1.0,
                    quick: bool = False) -> VerifyResult:
     """Verify S3 objects against dataset hash indexes."""
+    dataset_id = validate_dataset_id(dataset_id)
     if sample_fraction <= 0 or sample_fraction > 1:
         raise ValueError("sample_fraction must be > 0 and <= 1")
 
@@ -142,8 +148,11 @@ def _publication_contract_issues(s3, bucket: str, prefix: str,
                                  index: pa.Table) -> list[VerifyIssue]:
     uri = f"s3://{bucket}/{prefix}/manifest.yaml"
     try:
+        if head_object(s3, bucket, f"{prefix}/.publish-lock"):
+            raise ValueError("dataset publication is still in progress")
         manifest = yaml.safe_load(get_object_bytes(
             s3, bucket, f"{prefix}/manifest.yaml"))
+        validate_manifest_scope(manifest, bucket, prefix)
         contract = metadata_contract_from_manifest(manifest)
         metadata = _read_parquet_object(
             s3, bucket, f"{prefix}/metadata/samples.parquet")
@@ -159,6 +168,10 @@ def _publication_contract_issues(s3, bucket: str, prefix: str,
                 set(index_ids) != set(metadata_ids) or
                 set(index_ids) != set(manifest_ids)):
             raise ValueError("published sample rosters do not match exactly")
+        _validate_image_tables(
+            index, sample_manifests, metadata,
+            manifest["assets"]["images"]["uri"],
+        )
         mask_asset = (manifest.get("assets") or {}).get("masks")
         mask_objects = [
             obj for obj in list_objects(
@@ -177,12 +190,154 @@ def _publication_contract_issues(s3, bucket: str, prefix: str,
                     not set(mask_ids).issubset(set(index_ids)) or
                     len(mask_ids) != len(mask_objects)):
                 raise ValueError("mask roster is duplicate, orphaned, or incomplete")
+            _validate_mask_table(
+                mask_index, manifest["assets"]["masks"]["uri"])
     except Exception as exc:
         return [VerifyIssue(
             sample_id="", uri=uri, issue="mismatch",
             detail=f"publication contract is incomplete or invalid: {exc}",
         )]
     return []
+
+
+def _validate_image_tables(index: pa.Table, sample_manifests: pa.Table,
+                           metadata: pa.Table, image_root: str) -> None:
+    required_index = {"sample_id", "uri", "content_hash", "size", "source_kind"}
+    required_manifests = {
+        "sample_id", "source_kind", "primary_uri", "files_json",
+        "content_hash", "n_files",
+    }
+    if not required_index.issubset(index.column_names):
+        raise ValueError("content hash index schema is incomplete")
+    if not required_manifests.issubset(sample_manifests.column_names):
+        raise ValueError("sample manifests schema is incomplete")
+
+    index_rows = {row["sample_id"]: row for row in index.to_pylist()}
+    manifest_rows = {
+        row["sample_id"]: row for row in sample_manifests.to_pylist()
+    }
+    metadata_rows = {row["sample_id"]: row for row in metadata.to_pylist()}
+    seen_uris = set()
+    for sample_id, row in index_rows.items():
+        sample_manifest = manifest_rows[sample_id]
+        metadata_row = metadata_rows[sample_id]
+        source_kind = row.get("source_kind")
+        content_hash = str(row.get("content_hash") or "").lower()
+        if source_kind not in {"single_file", "dicom_series"}:
+            raise ValueError("content hash index has an invalid source_kind")
+        if (sample_manifest.get("source_kind") != source_kind or
+                str(sample_manifest.get("content_hash") or "").lower() != content_hash or
+                not _is_sha256(content_hash)):
+            raise ValueError("sample manifests do not match the content hash index")
+        if ("source_kind" in metadata_row and
+                metadata_row["source_kind"] != source_kind):
+            raise ValueError("samples metadata source_kind is inconsistent")
+
+        size = _nonnegative_integer(row.get("size"), "content hash index size")
+        if size < 0:
+            raise ValueError("content hash index size is invalid")
+        n_files = _positive_integer(
+            sample_manifest.get("n_files"), "sample manifest n_files")
+        if ("n_files" in metadata_row and
+                _positive_integer(metadata_row["n_files"], "metadata n_files") != n_files):
+            raise ValueError("samples metadata n_files is inconsistent")
+
+        uri = row.get("uri")
+        relative = _relative_collection_uri(uri, image_root)
+        if uri in seen_uris:
+            raise ValueError("content hash index has duplicate URIs")
+        seen_uris.add(uri)
+        try:
+            files = json.loads(sample_manifest.get("files_json") or "")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("sample manifest files_json is invalid") from exc
+        if not isinstance(files, list) or len(files) != n_files:
+            raise ValueError("sample manifest file roster is incomplete")
+        paths = []
+        for item in files:
+            if not isinstance(item, dict) or not _safe_relative_path(item.get("path")):
+                raise ValueError("sample manifest file path is invalid")
+            paths.append(item["path"])
+        if len(paths) != len(set(paths)):
+            raise ValueError("sample manifest file roster has duplicate paths")
+
+        primary_uri = sample_manifest.get("primary_uri")
+        if source_kind == "single_file":
+            if (n_files != 1 or primary_uri != relative or paths != [relative] or
+                    files[0].get("role") != "primary"):
+                raise ValueError("single-file sample manifest is inconsistent")
+        else:
+            relative = relative.rstrip("/")
+            if (primary_uri not in (None, "") or
+                    any(not path.startswith(f"{relative}/") for path in paths) or
+                    any(item.get("role") != "slice" for item in files)):
+                raise ValueError("DICOM sample manifest is inconsistent")
+
+
+def _validate_mask_table(index: pa.Table, mask_root: str) -> None:
+    required = {"sample_id", "uri", "content_hash", "size", "source_kind"}
+    if not required.issubset(index.column_names):
+        raise ValueError("mask content hash index schema is incomplete")
+    seen_uris = set()
+    for row in index.to_pylist():
+        if row.get("source_kind") != "mask_file":
+            raise ValueError("mask content hash index has an invalid source_kind")
+        if not _is_sha256(str(row.get("content_hash") or "").lower()):
+            raise ValueError("mask content hash index has an invalid content hash")
+        _nonnegative_integer(row.get("size"), "mask content hash index size")
+        uri = row.get("uri")
+        relative = _relative_collection_uri(uri, mask_root)
+        if not relative or relative.endswith("/") or uri in seen_uris:
+            raise ValueError("mask content hash index has an invalid or duplicate URI")
+        seen_uris.add(uri)
+
+
+def _relative_collection_uri(uri, root: str) -> str:
+    if not isinstance(uri, str) or not isinstance(root, str):
+        raise ValueError("collection index URI is invalid")
+    root = root.rstrip("/")
+    prefix = f"{root}/"
+    if not uri.startswith(prefix):
+        raise ValueError("collection index URI is outside its declared asset root")
+    relative = uri[len(prefix):]
+    if not relative or not _safe_relative_path(relative, allow_trailing=True):
+        raise ValueError("collection index URI is invalid")
+    return relative
+
+
+def _safe_relative_path(path, *, allow_trailing: bool = False) -> bool:
+    if not isinstance(path, str) or not path or path.startswith("/"):
+        return False
+    if any(char in path for char in ("\\", "\r", "\n")):
+        return False
+    value = path[:-1] if allow_trailing and path.endswith("/") else path
+    if not value:
+        return False
+    parts = value.split("/")
+    return all(part not in {"", ".", ".."} for part in parts)
+
+
+def _is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
+def _nonnegative_integer(value, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} is invalid")
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} is invalid") from exc
+    if numeric < 0 or numeric != value:
+        raise ValueError(f"{field} is invalid")
+    return numeric
+
+
+def _positive_integer(value, field: str) -> int:
+    numeric = _nonnegative_integer(value, field)
+    if numeric < 1:
+        raise ValueError(f"{field} is invalid")
+    return numeric
 
 
 def _sample_rows(rows: list[dict], fraction: float) -> list[dict]:
@@ -229,11 +384,17 @@ def _verify_row(s3, configured_bucket: str, row: dict,
         return _verify_dicom_series(
             s3, bucket, key, sample_id, uri, expected_hash,
             expected_size, expected_etag, quick,
+            expected_n_files=(manifest_rows.get(sample_id) or {}).get("n_files"),
         )
 
     meta = head_object(s3, bucket, key)
     if not meta:
         return VerifyIssue(sample_id, uri, "missing", "object is absent"), {key}, False
+    if meta.get("size") != expected_size:
+        return VerifyIssue(
+            sample_id, uri, "mismatch",
+            f"size {meta.get('size')} != recorded {expected_size}",
+        ), {key}, False
     if quick and expected_etag and meta.get("etag") == expected_etag and meta.get("size") == expected_size:
         return None, {key}, True
 
@@ -248,7 +409,8 @@ def _verify_row(s3, configured_bucket: str, row: dict,
 
 def _verify_dicom_series(s3, bucket: str, prefix_key: str, sample_id: str,
                          uri: str, expected_hash: str, expected_size: int,
-                         expected_etag: str | None, quick: bool
+                         expected_etag: str | None, quick: bool,
+                         expected_n_files=None,
                          ) -> tuple[VerifyIssue | None, set[str], bool]:
     prefix = prefix_key if prefix_key.endswith("/") else f"{prefix_key}/"
     objects = [
@@ -259,6 +421,16 @@ def _verify_dicom_series(s3, bucket: str, prefix_key: str, sample_id: str,
         return VerifyIssue(sample_id, uri, "missing", "DICOM series has no .dcm objects"), set(), False
     keys = {obj["key"] for obj in objects}
     total_size = sum(int(obj.get("size") or 0) for obj in objects)
+    if total_size != expected_size:
+        return VerifyIssue(
+            sample_id, uri, "mismatch",
+            f"series size {total_size} != recorded {expected_size}",
+        ), keys, False
+    if expected_n_files is not None and len(objects) != int(expected_n_files):
+        return VerifyIssue(
+            sample_id, uri, "mismatch",
+            f"series file count {len(objects)} != recorded {expected_n_files}",
+        ), keys, False
     etag_join = ",".join(obj.get("etag") or "" for obj in sorted(objects, key=lambda item: item["key"]))
     if quick and expected_etag and etag_join == expected_etag and total_size == expected_size:
         return None, keys, True

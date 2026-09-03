@@ -135,8 +135,8 @@ def load_profiles(path: str | None = None) -> dict[str, dict]:
             "default": {
                 "endpoint": os.environ.get("DSIMAGING_ENDPOINT", "http://127.0.0.1:9000"),
                 "bucket": os.environ.get("DSIMAGING_BUCKET", "imaging-data"),
-                "access_key": os.environ.get("DSIMAGING_ACCESS_KEY", "minioadmin"),
-                "secret_key": os.environ.get("DSIMAGING_SECRET_KEY", "minioadmin123"),
+                "access_key": os.environ.get("DSIMAGING_ACCESS_KEY", ""),
+                "secret_key": os.environ.get("DSIMAGING_SECRET_KEY", ""),
                 "region": os.environ.get("DSIMAGING_REGION", ""),
                 "controller_url": os.environ.get("DSIMAGING_CONTROLLER_URL", ""),
                 "controller_token": os.environ.get(
@@ -306,8 +306,8 @@ def render_store_admin(config: dict) -> None:
                         force=True,
                         controller_image=DEFAULT_CONTROLLER_IMAGE,
                         bucket=bucket,
-                        access_key=config["access_key"] or "minioadmin",
-                        secret_key=config["secret_key"] or "minioadmin123",
+                        access_key=config["access_key"] or None,
+                        secret_key=config["secret_key"] or None,
                     )
                     st.write(cfg.to_dict())
                     st.info(f"Webhook target: {controller_webhook}")

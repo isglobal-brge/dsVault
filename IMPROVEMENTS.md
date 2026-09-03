@@ -21,9 +21,9 @@ was the wrong boundary for this project and has been intentionally removed.
   Docker Compose, `.env`, MinIO init script and controller settings.
 - `store up`, `store down`, `store ps`, `store logs`, `store config` and
   `store doctor` operate that generated store from the admin CLI.
-- The default controller image is
-  `davidsarratgonzalez/dsimaging-store:latest`, with local-build support for
-  development.
+- The default controller, MinIO and MinIO client images are pinned by release
+  tag and multi-architecture manifest digest, with local controller-build
+  support for development.
 
 ### Dataset administration
 

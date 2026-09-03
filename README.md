@@ -9,17 +9,27 @@ medical imaging datasets stored in them.
 pip install dsimaging-admin
 ```
 
+Python 3.10 or newer is required.
+
 ## Create a store
 
 `dsimaging-admin store init` provisions the configured backend. With MinIO it
 writes a Docker Compose project for MinIO plus the `dsimaging-store` controller:
 
 ```bash
-dsimaging-admin store init ./study-store \
-  --controller-image davidsarratgonzalez/dsimaging-store:latest
+dsimaging-admin store init ./study-store
 dsimaging-admin store up ./study-store
 dsimaging-admin store doctor ./study-store
 ```
+
+The generated project pins the published multi-architecture controller, MinIO
+and MinIO client images by both release tag and manifest-list digest. Use
+`--controller-image` only to select a deliberate controller upgrade.
+
+New local projects generate unique MinIO credentials and an operator token in
+`./study-store/.env` (mode `0600`). MinIO's API, console and controller are
+bound to `127.0.0.1` by default. Configure a CLI profile from those generated
+values before running dataset commands; no shared MinIO credential is built in.
 
 For local controller development, build from a checked-out `dsimaging-store`
 repo instead of using an image:
@@ -182,8 +192,8 @@ profiles:
     controller_url: http://127.0.0.1:8080
     controller_token: <operator token>
     bucket: imaging-data
-    access_key: minioadmin
-    secret_key: minioadmin123
+    access_key: <value from the store .env MINIO_ROOT_USER>
+    secret_key: <value from the store .env MINIO_ROOT_PASSWORD>
     region: ""
     aws:
       sqs_queue_url: ""
@@ -197,8 +207,8 @@ Environment variables override profile values:
 | `DSIMAGING_ENDPOINT` | `http://127.0.0.1:9000` | S3/MinIO endpoint |
 | `DSIMAGING_CONTROLLER_URL` | (empty) | dsimaging-store controller URL |
 | `DSIMAGING_CONTROLLER_TOKEN` | (empty) | Bearer token for controller inventory and manual reconcile |
-| `DSIMAGING_ACCESS_KEY` | `minioadmin` | S3 access key |
-| `DSIMAGING_SECRET_KEY` | `minioadmin123` | S3 secret key |
+| `DSIMAGING_ACCESS_KEY` | unset | S3 access key (required for local MinIO) |
+| `DSIMAGING_SECRET_KEY` | unset | S3 secret key (required for local MinIO) |
 | `DSIMAGING_BUCKET` | `imaging-data` | Bucket name |
 | `DSIMAGING_REGION` | (empty) | S3 region |
 | `DSIMAGING_BACKEND` | `auto` | Backend override: `auto`, `minio`, `aws` or `s3-compatible` |
@@ -216,10 +226,12 @@ Generated local Compose projects publish the controller on `127.0.0.1` only;
 MinIO delivers notifications over the internal Compose network.
 
 `dataset verify` checks the published manifest and its pinned patient contract,
-the exact image/metadata/sample-manifest roster, mask mappings, index entries,
-and selected object hashes. Missing, extra, duplicate, orphaned, or corrupt
-publication metadata makes verification fail rather than accepting a reduced
-view of the collection.
+requires every URI to remain under the collection's own prefix, cross-checks
+the exact image/metadata/sample-manifest roster and row contents, validates mask
+mappings, sizes and selected object hashes, and refuses verification while a
+publish lock exists. Missing, extra, duplicate, orphaned, cross-collection, or
+corrupt publication metadata makes verification fail rather than accepting a
+reduced view of the collection.
 
 ## Dataset layout in S3
 

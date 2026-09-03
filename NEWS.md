@@ -1,5 +1,24 @@
 # NEWS
 
+## 0.3.8
+
+- The declared minimum Python version is now 3.10, matching the requirement of
+  the supported `pydicom>=3.0.0` dependency.
+- Generated stores pin the controller, MinIO and MinIO client images by release
+  tag and multi-architecture manifest digest instead of following `latest`.
+- Store manifests and index rows are confined to one canonical collection
+  prefix; verification cross-checks hashes, sizes, source kinds, file rosters
+  and metadata instead of accepting internally inconsistent artifacts.
+- Local scans reject traversal-like paths and symbolic links so publishing a
+  collection cannot silently import files from another filesystem tree;
+  dataset downloads also remain confined to their requested destination.
+- New local stores use unique generated MinIO credentials, bind API and console
+  ports to loopback, and require explicit credentials instead of shared
+  defaults. Forced regeneration preserves existing generated credentials.
+- Repeated MinIO initialization replaces only the controller's matching event
+  rule before adding it, avoiding overlapping notification filters without
+  relying on tools absent from the `minio/mc` image.
+
 ## 0.3.7
 
 - Dataset manifests now require and preserve the patient-level privacy-unit

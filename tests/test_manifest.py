@@ -160,6 +160,30 @@ class ManifestTests(unittest.TestCase):
             "label_col": "diagnosis",
         })
 
+    def test_generate_manifest_rejects_preserved_cross_collection_asset(self):
+        source = generate_manifest(
+            "source", "imaging-data", "datasets/source",
+            privacy_unit_col="patient_id",
+        )
+        source["assets"]["extra"] = {
+            "uri": "s3://imaging-data/datasets/source/source/extra/",
+        }
+
+        with self.assertRaisesRegex(ValueError, "outside its collection"):
+            generate_manifest(
+                "target", "imaging-data", "datasets/target",
+                privacy_unit_col="patient_id", existing_manifest=source,
+            )
+
+        source["assets"].pop("extra")
+        source["metadata"]["file"] = (
+            "s3://imaging-data/datasets/source/metadata/legacy.parquet")
+        regenerated = generate_manifest(
+            "source", "imaging-data", "datasets/source",
+            privacy_unit_col="patient_id", existing_manifest=source,
+        )
+        self.assertNotIn("file", regenerated["metadata"])
+
     def test_build_tables_use_canonical_uris(self):
         samples = [{
             "sample_id": "a",
@@ -365,6 +389,28 @@ class ManifestTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "duplicate sample_id"):
             scan_s3_images(FakeS3(payloads), bucket, prefix, objects)
+
+    def test_scans_reject_traversal_keys_and_symbolic_links(self):
+        prefix = "datasets/study_ct_v1"
+        key = f"{prefix}/source/images/../other/case001.nii.gz"
+        with self.assertRaisesRegex(ValueError, "asset path is invalid"):
+            scan_s3_images(
+                FakeS3({key: b"image"}), "imaging-data", prefix,
+                [{"key": key, "size": 5}],
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            images = os.path.join(tmpdir, "images")
+            os.makedirs(images)
+            target = os.path.join(tmpdir, "outside.nii.gz")
+            with open(target, "wb") as stream:
+                stream.write(b"image")
+            try:
+                os.symlink(target, os.path.join(images, "case001.nii.gz"))
+            except (OSError, NotImplementedError):
+                return
+            with self.assertRaisesRegex(ValueError, "symbolic links"):
+                scan_images(tmpdir)
 
     def _metadata_csv(self, contents: str) -> str:
         handle = tempfile.NamedTemporaryFile(

@@ -472,6 +472,27 @@ class DatasetCliTests(unittest.TestCase):
                 [],
             )
 
+    @unittest.skipUnless(HAS_MOTO, "moto is not installed")
+    def test_download_rejects_object_paths_outside_destination(self):
+        with mock_aws(), tempfile.TemporaryDirectory() as tmpdir:
+            bucket = "imaging-data"
+            s3 = boto3.client("s3", region_name="us-east-1")
+            s3.create_bucket(Bucket=bucket)
+            s3.put_object(
+                Bucket=bucket, Key="datasets/study/../outside.txt",
+                Body=b"must-not-be-written",
+            )
+            destination = os.path.join(tmpdir, "download")
+
+            result = CliRunner().invoke(main, [
+                "--backend", "aws", "--bucket", bucket,
+                "dataset", "download", "study", destination,
+            ])
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("unsafe object path", result.output)
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, "outside.txt")))
+
     def _make_source(self, tmpdir: str, sample_id: str, payload: bytes,
                      root: str = "source") -> str:
         source = os.path.join(tmpdir, root)
