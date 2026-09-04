@@ -16,11 +16,42 @@ except Exception:
     HAS_MOTO = False
 
 from dsimaging_admin.cli import main
-from dsimaging_admin.s3 import provision_aws_store
+from dsimaging_admin.s3 import (
+    _ensure_bucket_notification,
+    _event_queue_name,
+    provision_aws_store,
+)
 
 
 @unittest.skipUnless(HAS_MOTO, "moto is not installed")
 class AwsProvisioningTests(unittest.TestCase):
+    def test_legacy_managed_notification_is_replaced_by_hashed_queue(self):
+        class FakeS3:
+            def __init__(self):
+                self.updated = None
+
+            def get_bucket_notification_configuration(self, *, Bucket):
+                return {"QueueConfigurations": [{
+                    "Id": "dsimaging-store-events",
+                    "QueueArn": "arn:aws:sqs:us-east-1:1:legacy",
+                    "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
+                }]}
+
+            def put_bucket_notification_configuration(
+                    self, *, Bucket, NotificationConfiguration):
+                self.updated = NotificationConfiguration
+
+        s3 = FakeS3()
+        changed = _ensure_bucket_notification(
+            s3, "imaging-data", "arn:aws:sqs:us-east-1:1:hashed")
+
+        self.assertTrue(changed)
+        self.assertEqual(s3.updated["QueueConfigurations"], [{
+            "Id": "dsimaging-store-events",
+            "QueueArn": "arn:aws:sqs:us-east-1:1:hashed",
+            "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
+        }])
+
     def test_provision_bucket_versioning_queue_and_notification_idempotently(self):
         with mock_aws():
             s3 = boto3.client("s3", region_name="us-east-1")
@@ -44,7 +75,7 @@ class AwsProvisioningTests(unittest.TestCase):
             ]["Rules"][0]["ApplyServerSideEncryptionByDefault"]
             self.assertEqual(rule["SSEAlgorithm"], "AES256")
             queue_url = sqs.get_queue_url(
-                QueueName="dsimaging-store-imaging-data-events"
+                QueueName=_event_queue_name("imaging-data")
             )["QueueUrl"]
             attrs = sqs.get_queue_attributes(
                 QueueUrl=queue_url,
@@ -99,7 +130,7 @@ class AwsProvisioningTests(unittest.TestCase):
             s3 = boto3.client("s3", region_name="us-east-1")
             sqs = boto3.client("sqs", region_name="us-east-1")
             queue_url = sqs.create_queue(
-                QueueName="dsimaging-store-imaging-data-events"
+                QueueName=_event_queue_name("imaging-data")
             )["QueueUrl"]
             existing_policy = {
                 "Version": "2012-10-17",
@@ -180,6 +211,35 @@ class AwsProvisioningTests(unittest.TestCase):
             }
             self.assertIn(other_arn, queue_arns)
             self.assertIn(report["sqs_queue_arn"], queue_arns)
+
+    def test_similar_bucket_names_receive_distinct_event_queues_and_policies(self):
+        with mock_aws():
+            s3 = boto3.client("s3", region_name="us-east-1")
+            sqs = boto3.client("sqs", region_name="us-east-1")
+
+            reports = {
+                bucket: provision_aws_store(
+                    None, bucket, "us-east-1", s3_client=s3, sqs_client=sqs)
+                for bucket in ("imaging.a", "imaging-a")
+            }
+
+            self.assertNotEqual(
+                reports["imaging.a"]["sqs_queue_url"],
+                reports["imaging-a"]["sqs_queue_url"],
+            )
+            for bucket, report in reports.items():
+                policy = sqs.get_queue_attributes(
+                    QueueUrl=report["sqs_queue_url"],
+                    AttributeNames=["Policy"],
+                )["Attributes"]["Policy"]
+                self.assertIn(f"arn:aws:s3:::{bucket}", policy)
+                notification = s3.get_bucket_notification_configuration(
+                    Bucket=bucket)
+                self.assertEqual(
+                    [item["QueueArn"] for item in
+                     notification["QueueConfigurations"]],
+                    [report["sqs_queue_arn"]],
+                )
 
     def test_cli_store_init_aws_persists_queue_url_idempotently(self):
         with mock_aws(), tempfile.TemporaryDirectory() as tmpdir:

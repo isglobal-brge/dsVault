@@ -53,7 +53,8 @@ class VerifyResult:
 
 def verify_dataset(s3, bucket: str, dataset_id: str,
                    sample_fraction: float = 1.0,
-                   quick: bool = False) -> VerifyResult:
+                   quick: bool = False,
+                   expected_publish_lock: dict | None = None) -> VerifyResult:
     """Verify S3 objects against dataset hash indexes."""
     dataset_id = validate_dataset_id(dataset_id)
     if sample_fraction <= 0 or sample_fraction > 1:
@@ -71,7 +72,7 @@ def verify_dataset(s3, bucket: str, dataset_id: str,
     main_table = _read_parquet_object(s3, bucket, f"{prefix}/indexes/content_hash_index.parquet")
     tables.append(("images", main_table))
     issues.extend(_publication_contract_issues(
-        s3, bucket, prefix, main_table))
+        s3, bucket, prefix, main_table, expected_publish_lock))
     try:
         mask_table = _read_parquet_object(
             s3, bucket, f"{prefix}/indexes/masks_content_hash_index.parquet"
@@ -147,11 +148,13 @@ def _read_sample_manifest_rows(s3, bucket: str, prefix: str) -> dict[str, dict]:
 
 
 def _publication_contract_issues(s3, bucket: str, prefix: str,
-                                 index: pa.Table) -> list[VerifyIssue]:
+                                 index: pa.Table,
+                                 expected_publish_lock: dict | None = None,
+                                 ) -> list[VerifyIssue]:
     uri = f"s3://{bucket}/{prefix}/manifest.yaml"
     try:
-        if head_object(s3, bucket, f"{prefix}/.publish-lock"):
-            raise ValueError("dataset publication is still in progress")
+        _validate_publish_lock(
+            s3, bucket, f"{prefix}/.publish-lock", expected_publish_lock)
         manifest = yaml.safe_load(get_object_bytes(
             s3, bucket, f"{prefix}/manifest.yaml"))
         validate_manifest_scope(manifest, bucket, prefix)
@@ -201,6 +204,44 @@ def _publication_contract_issues(s3, bucket: str, prefix: str,
             detail=f"publication contract is incomplete or invalid: {exc}",
         )]
     return []
+
+
+def _validate_publish_lock(s3, bucket: str, key: str,
+                           expected: dict | None) -> None:
+    current = head_object(s3, bucket, key)
+    if expected is None:
+        if current:
+            raise ValueError("dataset publication is still in progress")
+        return
+    if expected.get("key") != key:
+        raise ValueError("expected publication lock is outside this dataset")
+    if current is None:
+        raise ValueError("expected publication lock is missing")
+
+    expected_etag = str(expected.get("etag") or "").strip('"') or None
+    if expected_etag and current.get("etag") != expected_etag:
+        raise ValueError("publication lock ETag no longer matches")
+    expected_version = expected.get("version_id")
+    if expected_version and current.get("version_id") != expected_version:
+        raise ValueError("publication lock version no longer matches")
+
+    kwargs = {"Bucket": bucket, "Key": key}
+    if expected.get("etag"):
+        kwargs["IfMatch"] = expected["etag"]
+    response = s3.get_object(**kwargs)
+    body = response["Body"]
+    try:
+        payload = json.loads(body.read())
+    finally:
+        body.close()
+    response_etag = str(response.get("ETag") or "").strip('"') or None
+    if expected_etag and response_etag != expected_etag:
+        raise ValueError("publication lock changed while it was read")
+    if (expected_version and
+            response.get("VersionId") != expected_version):
+        raise ValueError("publication lock version changed while it was read")
+    if not isinstance(payload, dict) or payload.get("owner") != expected.get("owner"):
+        raise ValueError("publication lock is owned by another operation")
 
 
 def _validate_image_tables(index: pa.Table, sample_manifests: pa.Table,

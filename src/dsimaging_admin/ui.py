@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 import yaml
+import click
 
 try:
     import streamlit as st
@@ -26,19 +27,21 @@ try:  # pragma: no cover - optional dependency
 except ImportError:  # pragma: no cover - optional dependency
     st_autorefresh = None
 
-import boto3
 import requests
 
 from dsimaging_admin import controller as controller_api
 from dsimaging_admin.cli import (
     _atomic_upload_sources,
+    _delete_dataset_current,
     _finish_atomic_publish,
-    _partition_uploads,
+    _hydrate_local_store_profile,
     _persist_aws_queue_url,
+    _publication_metadata,
+    _publish_dataset_atomic,
+    _purge_dataset,
     _read_manifest_strict,
-    _read_existing_samples_metadata,
     _rescan_dataset_artifacts,
-    _write_dataset_artifacts,
+    _validate_controller_url,
 )
 from dsimaging_admin.manifest import (
     build_samples_metadata,
@@ -47,21 +50,22 @@ from dsimaging_admin.manifest import (
     scan_images,
     scan_masks,
     scan_s3_images,
-    scan_s3_masks,
     validate_dataset_id,
     validate_dicom_series,
 )
+from dsimaging_admin.hashing import sha256_file
 from dsimaging_admin.s3 import (
     create_client,
-    delete_keys,
-    delete_object_versions,
+    create_sqs_client,
     detect_backend,
     get_object_bytes,
+    is_loopback_s3_endpoint,
     is_native_aws_s3_endpoint,
     list_datasets,
-    list_objects,
     list_object_versions,
+    list_objects,
     provision_aws_store,
+    validate_s3_endpoint,
 )
 from dsimaging_admin.store import (
     DEFAULT_CONTROLLER_IMAGE,
@@ -78,7 +82,8 @@ BACKENDS = ["auto", "minio", "aws", "s3-compatible"]
 
 
 def launch_ui(host: str = "127.0.0.1", port: int = 8501,
-              open_browser: bool = False) -> None:
+              open_browser: bool = False,
+              environment: dict[str, str] | None = None) -> None:
     script = Path(__file__).resolve()
     args = [
         sys.executable,
@@ -93,7 +98,9 @@ def launch_ui(host: str = "127.0.0.1", port: int = 8501,
         "--server.headless",
         "false" if open_browser else "true",
     ]
-    raise SystemExit(subprocess.call(args))
+    child_environment = os.environ.copy()
+    child_environment.update(environment or {})
+    raise SystemExit(subprocess.call(args, env=child_environment))
 
 
 def run_app() -> None:
@@ -107,11 +114,18 @@ def run_app() -> None:
     except ValueError as exc:
         st.error(str(exc))
         return
-    config = edit_connection_config(profiles.get(selected_profile, {}))
+    try:
+        profile = _hydrate_connection_profile(
+            profiles.get(selected_profile, {}))
+        config = edit_connection_config(profile, selected_profile)
+    except Exception as exc:
+        st.error(str(exc))
+        return
     config["_profile"] = selected_profile
     config["_config_path"] = (
         os.environ.get("DSIMAGING_CONFIG") or DEFAULT_CONFIG_PATH
     )
+    _reset_connection_scoped_results(config)
 
     page = st.sidebar.radio(
         "Navigation",
@@ -145,9 +159,16 @@ def run_app() -> None:
 def load_profiles(path: str | None = None) -> dict[str, dict]:
     config_path = path or os.environ.get("DSIMAGING_CONFIG") or DEFAULT_CONFIG_PATH
     if not os.path.exists(config_path):
+        backend = os.environ.get("DSIMAGING_BACKEND", "auto")
+        endpoint = os.environ.get("DSIMAGING_ENDPOINT")
+        if endpoint is None:
+            endpoint = (
+                "" if backend in {"aws", "s3-compatible"}
+                else "http://127.0.0.1:9000"
+            )
         return {
             "default": {
-                "endpoint": os.environ.get("DSIMAGING_ENDPOINT", "http://127.0.0.1:9000"),
+                "endpoint": endpoint,
                 "bucket": os.environ.get("DSIMAGING_BUCKET", "imaging-data"),
                 "access_key": os.environ.get("DSIMAGING_ACCESS_KEY", ""),
                 "secret_key": os.environ.get("DSIMAGING_SECRET_KEY", ""),
@@ -205,11 +226,48 @@ def profile_picker(profiles: dict[str, dict]) -> str:
     return st.sidebar.selectbox("Profile", names, index=index)
 
 
-def edit_connection_config(profile: dict) -> dict:
+def _hydrate_connection_profile(profile: dict) -> dict:
+    """Resolve a local pointer unless an explicit remote target supersedes it."""
+    try:
+        return _hydrate_local_store_profile(profile)
+    except click.ClickException:
+        requested_backend = (
+            os.environ.get("DSIMAGING_BACKEND")
+            or profile.get("backend") or "auto")
+        alternate_store_requested = bool(
+            os.environ.get("DSIMAGING_ENDPOINT")
+            or profile.get("endpoint")
+            or requested_backend in {"aws", "s3-compatible"}
+        )
+        if (profile.get("kind") == "local-store"
+                and alternate_store_requested):
+            return dict(profile)
+        raise
+
+
+def edit_connection_config(profile: dict, profile_name: str = "default") -> dict:
     st.sidebar.subheader("Connection")
+    backend = st.sidebar.selectbox(
+        "Backend override",
+        BACKENDS,
+        index=BACKENDS.index(_normalise_backend(_resolve_value(
+            "DSIMAGING_BACKEND", profile, "backend", "auto"))),
+    )
+    endpoint_profile = {} if backend == "aws" else profile
+    endpoint_fallback = (
+        "" if backend in {"aws", "s3-compatible"}
+        else "http://127.0.0.1:9000"
+    )
+    endpoint_default = _resolve_value(
+        "DSIMAGING_ENDPOINT",
+        endpoint_profile,
+        "endpoint",
+        endpoint_fallback,
+    )
+    validate_s3_endpoint(endpoint_default or None)
     endpoint = st.sidebar.text_input(
         "Endpoint",
-        value=_resolve_value("DSIMAGING_ENDPOINT", profile, "endpoint", "http://127.0.0.1:9000"),
+        value=endpoint_default,
     )
     bucket = st.sidebar.text_input(
         "Bucket",
@@ -219,51 +277,103 @@ def edit_connection_config(profile: dict) -> dict:
         "Region",
         value=_resolve_value("DSIMAGING_REGION", profile, "region", ""),
     )
-    access_key = st.sidebar.text_input(
+    s3_credential_scope = (profile_name, backend, endpoint.rstrip("/"))
+    if st.session_state.get("_s3_credential_scope") != s3_credential_scope:
+        st.session_state.pop("_s3_access_key", None)
+        st.session_state.pop("_s3_secret_key", None)
+        st.session_state["_s3_credential_scope"] = s3_credential_scope
+    entered_access_key = st.sidebar.text_input(
         "Access key",
         value="",
         type="password",
+        key="_s3_access_key",
         help="Enter for this browser session; stored credentials are never prefilled.",
     )
-    secret_key = st.sidebar.text_input(
+    entered_secret_key = st.sidebar.text_input(
         "Secret key",
         value="",
         type="password",
+        key="_s3_secret_key",
         help="Enter for this browser session; stored credentials are never prefilled.",
     )
-    backend = st.sidebar.selectbox(
-        "Backend override",
-        BACKENDS,
-        index=BACKENDS.index(_normalise_backend(_resolve_value("DSIMAGING_BACKEND", profile, "backend", "auto"))),
-    )
+    controller_url_default = _resolve_value(
+        "DSIMAGING_CONTROLLER_URL", profile, "controller_url", "")
+    _validate_controller_url(controller_url_default or None)
     controller_url = st.sidebar.text_input(
         "Controller URL",
-        value=_resolve_value("DSIMAGING_CONTROLLER_URL", profile, "controller_url", ""),
+        value=controller_url_default,
     )
-    controller_token = st.sidebar.text_input(
+    _validate_controller_url(controller_url or None)
+    controller_credential_scope = (profile_name, controller_url.rstrip("/"))
+    if (st.session_state.get("_controller_credential_scope")
+            != controller_credential_scope):
+        st.session_state.pop("_controller_token", None)
+        st.session_state["_controller_credential_scope"] = (
+            controller_credential_scope)
+    entered_controller_token = st.sidebar.text_input(
         "Controller operator token",
         value="",
         type="password",
+        key="_controller_token",
         help="Enter for this browser session; stored tokens are never prefilled.",
     )
     sqs_queue_url = st.sidebar.text_input(
         "SQS queue URL",
-        value=_nested_value(profile, "aws", "sqs_queue_url")
-        or os.environ.get("DSIMAGING_SQS_QUEUE_URL", ""),
+        value=os.environ.get("DSIMAGING_SQS_QUEUE_URL", "")
+        or _nested_value(profile, "aws", "sqs_queue_url"),
+    )
+    validate_s3_endpoint(endpoint or None)
+    if backend == "s3-compatible" and not endpoint:
+        raise ValueError(
+            "s3-compatible mode requires an explicit endpoint URL")
+    if backend == "aws" and endpoint and not is_native_aws_s3_endpoint(endpoint):
+        raise ValueError(
+            "AWS mode accepts only a native HTTPS S3 endpoint; "
+            "leave Endpoint empty to use the AWS SDK default"
+        )
+    local_endpoint = profile.get("_local_endpoint")
+    use_local_secrets = bool(
+        profile.get("kind") == "local-store"
+        and local_endpoint
+        and endpoint.rstrip("/") == str(local_endpoint).rstrip("/")
+    )
+    access_key = (
+        entered_access_key
+        or os.environ.get("DSIMAGING_ACCESS_KEY", "")
+        or (profile.get("access_key", "") if use_local_secrets else "")
+    )
+    secret_key = (
+        entered_secret_key
+        or os.environ.get("DSIMAGING_SECRET_KEY", "")
+        or (profile.get("secret_key", "") if use_local_secrets else "")
+    )
+    local_controller_url = profile.get("_local_controller_url")
+    use_local_controller_token = bool(
+        profile.get("kind") == "local-store"
+        and local_controller_url
+        and controller_url.rstrip("/") == str(local_controller_url).rstrip("/")
+    )
+    controller_token = (
+        entered_controller_token
+        or os.environ.get("DSIMAGING_CONTROLLER_TOKEN", "")
+        or (profile.get("controller_token", "")
+            if use_local_controller_token else "")
     )
     st.sidebar.markdown(
         f"Access key: **{_secret_badge(access_key)}**  \n"
         f"Secret key: **{_secret_badge(secret_key)}**  \n"
         f"Controller token: **{_secret_badge(controller_token)}**"
     )
-    if any(_resolve_value(envvar, profile, key, "") for envvar, key in (
-        ("DSIMAGING_ACCESS_KEY", "access_key"),
-        ("DSIMAGING_SECRET_KEY", "secret_key"),
-        ("DSIMAGING_CONTROLLER_TOKEN", "controller_token"),
-    )):
+    if use_local_secrets or use_local_controller_token:
         st.sidebar.caption(
-            "Stored credentials are available to the CLI but are deliberately "
-            "not loaded into this unauthenticated dashboard."
+            "Local-store credentials are resolved server-side and never "
+            "prefilled into browser fields."
+        )
+    elif any(profile.get(key) for key in (
+            "access_key", "secret_key", "controller_token")):
+        st.sidebar.caption(
+            "Credentials embedded in non-local profiles are deliberately not "
+            "loaded into this unauthenticated dashboard."
         )
     resolved_backend, rationale = detect_backend(endpoint, backend)
     return {
@@ -278,7 +388,73 @@ def edit_connection_config(profile: dict) -> dict:
         "controller_url": controller_url,
         "controller_token": controller_token,
         "sqs_queue_url": sqs_queue_url,
+        "kind": profile.get("kind"),
+        "store_path": profile.get("store_path"),
     }
+
+
+def _connection_scope(config: dict) -> tuple:
+    return (
+        config.get("_profile"),
+        config.get("backend"),
+        config.get("resolved_backend"),
+        config.get("endpoint"),
+        config.get("bucket"),
+        config.get("region"),
+        config.get("controller_url"),
+        config.get("sqs_queue_url"),
+        config.get("kind"),
+        config.get("store_path"),
+    )
+
+
+def _reset_connection_scoped_results(config: dict) -> None:
+    scope = _connection_scope(config)
+    if st.session_state.get("_connection_scope") == scope:
+        return
+    for key in (
+        "doctor_checks",
+        "compose_status",
+        "compose-project",
+        "store-project-path",
+        "store-bucket",
+        "store-region",
+        "store-kms-key",
+        "publish_preview",
+        "publish_preview_signature",
+        "modify_preview",
+        "modify-dataset",
+        "modify-metadata",
+        "modify-images",
+        "modify-masks",
+        "delete-dataset",
+        "delete-dry-run",
+        "delete-purge",
+        "delete-confirmation",
+    ):
+        st.session_state.pop(key, None)
+    st.session_state["_connection_scope"] = scope
+
+
+def _has_owned_local_compose_project(config: dict) -> bool:
+    return bool(
+        config.get("kind") == "local-store"
+        and config.get("store_path")
+        and is_loopback_s3_endpoint(config.get("endpoint"))
+    )
+
+
+def _can_initialize_local_project(config: dict) -> bool:
+    return bool(
+        config.get("resolved_backend") == "minio"
+        and is_loopback_s3_endpoint(config.get("endpoint"))
+    )
+
+
+def _owned_local_compose_path(config: dict) -> str | None:
+    if not _has_owned_local_compose_project(config):
+        return None
+    return str(Path(config["store_path"]).expanduser().resolve())
 
 
 def render_connect_doctor(config: dict) -> None:
@@ -332,17 +508,29 @@ def render_capabilities(config: dict) -> None:
 def render_store_admin(config: dict) -> None:
     st.header("Store administration")
     backend = config["resolved_backend"]
+    owned_compose_path = _owned_local_compose_path(config)
+    local_init = _can_initialize_local_project(config)
+    aws_profile_conflict = bool(
+        backend == "aws" and config.get("kind") == "local-store")
+    default_project = config.get("store_path") or "./study-store"
     with st.form("store-init-form"):
         st.subheader("Init store")
-        project_path = st.text_input("Local store project path", value="./study-store")
-        bucket = st.text_input("Bucket name", value=config["bucket"] or "imaging-data")
-        region = st.text_input("Region", value=config["region"])
-        kms_key = st.text_input("KMS key", value="", type="password")
-        controller_webhook = st.text_input(
-            "Controller webhook URL",
-            value=config["controller_url"] or "http://controller:8080/webhook/minio",
+        project_path = st.text_input(
+            "Local store project path", value=default_project,
+            key="store-project-path")
+        bucket = st.text_input(
+            "Bucket name", value=config["bucket"] or "imaging-data",
+            key="store-bucket")
+        region = st.text_input(
+            "Region", value=config["region"], key="store-region")
+        kms_key = st.text_input(
+            "KMS key", value="", type="password", key="store-kms-key")
+        run = st.form_submit_button("Run", disabled=aws_profile_conflict)
+    if aws_profile_conflict:
+        st.warning(
+            "This profile owns a local Compose project and cannot be reused "
+            "for AWS provisioning. Select or create a separate AWS profile."
         )
-        run = st.form_submit_button("Run")
     if run:
         with st.expander("Operation log", expanded=True):
             try:
@@ -362,37 +550,43 @@ def render_store_admin(config: dict) -> None:
                         )
                         config["sqs_queue_url"] = report["sqs_queue_url"]
                         st.info("SQS queue URL saved to the selected profile.")
-                elif backend == "s3-compatible":
+                elif not local_init:
                     st.error(
-                        "An existing S3-compatible endpoint is connect-only; "
+                        "An existing remote endpoint is connect-only; "
                         "configure it and run Doctor instead."
                     )
                 else:
                     cfg = init_store(
                         project_path,
-                        force=True,
+                        force=False,
                         controller_image=DEFAULT_CONTROLLER_IMAGE,
                         bucket=bucket,
-                        access_key=config["access_key"] or None,
-                        secret_key=config["secret_key"] or None,
                     )
                     st.write(cfg.to_dict())
-                    st.info(f"Webhook target: {controller_webhook}")
             except Exception as exc:
                 st.error(str(exc))
 
     st.subheader("Compose controls")
-    project_path = st.text_input("Compose project path", value="./study-store", key="compose-project")
-    disabled = backend == "aws"
+    st.text_input(
+        "Compose project path",
+        value=owned_compose_path or default_project,
+        key="compose-project",
+        disabled=True,
+        help="Compose controls are scoped to the selected local-store profile.",
+    )
+    disabled = owned_compose_path is None
     cols = st.columns(3)
     if cols[0].button("Up", disabled=disabled, help="Disabled for AWS backend"):
-        st.code(compose_up(project_path))
+        st.code(compose_up(owned_compose_path))
     if cols[1].button("Down", disabled=disabled, help="Disabled for AWS backend"):
-        st.code(compose_down(project_path))
+        st.code(compose_down(owned_compose_path))
     if cols[2].button("Refresh status", disabled=disabled):
-        st.session_state["compose_status"] = compose_status(project_path)
+        st.session_state["compose_status"] = compose_status(owned_compose_path)
     if disabled:
-        st.info("AWS backend: the store is serverless; deploy the controller separately.")
+        st.info(
+            "Remote backend: local Compose controls are unavailable; "
+            "operate that deployment separately."
+        )
     status = st.session_state.get("compose_status")
     if status:
         st.subheader("Compose stack status")
@@ -465,7 +659,8 @@ def render_publish(config: dict) -> None:
     dataset_id = st.text_input("Dataset ID", key="publish-dataset")
     source_path = st.text_input("Source path", key="publish-source")
     metadata_path = st.text_input(
-        "Metadata path (required)", key="publish-metadata")
+        "Metadata path (optional when SOURCE/metadata.csv or .parquet is unique)",
+        key="publish-metadata")
     privacy_unit_column = st.text_input(
         "Patient privacy-unit column", key="publish-privacy-unit-column"
     )
@@ -478,25 +673,80 @@ def render_publish(config: dict) -> None:
     )
     replace = st.checkbox("Replace an existing dataset atomically", value=False)
     modality = st.selectbox("Modality", ["ct", "mri", "pet", "xray", "unknown"], index=0)
-    resource_endpoint = st.text_input("Resource endpoint override", value=config["endpoint"])
-    if resource_endpoint:
-        config = config | {"endpoint": resource_endpoint}
+    verify_mode = st.selectbox(
+        "Verify before commit", ["quick", "full", "none"], index=0)
+    label_levels = [
+        value.strip() for value in label_levels_text.split(",")
+        if value.strip()
+    ]
+    input_signature = hashlib.sha256(json.dumps({
+        "dataset_id": dataset_id,
+        "source_path": source_path,
+        "metadata_path": metadata_path,
+        "privacy_unit_column": privacy_unit_column,
+        "label_column": label_column,
+        "label_levels": label_levels_text,
+        "replace": replace,
+        "modality": modality,
+        "verify": verify_mode,
+        "profile": config.get("_profile"),
+        "endpoint": config.get("endpoint"),
+        "bucket": config.get("bucket"),
+    }, sort_keys=True).encode("utf-8")).hexdigest()
     if st.button("Preview scan"):
-        st.session_state["publish_preview"] = preview_scan(source_path)
-    render_preview("publish_preview")
-    if st.button("Publish"):
+        st.session_state.pop("publish_preview_signature", None)
+        try:
+            st.session_state["publish_preview"] = publication_preflight(
+                dataset_id,
+                source_path,
+                metadata_path or None,
+                privacy_unit_column or None,
+                label_column or None,
+                label_levels,
+            )
+            if list_objects(
+                    make_s3_client(config), config["bucket"],
+                    f"datasets/{dataset_id}/") and not replace:
+                raise ValueError(
+                    "dataset already exists; select explicit atomic replacement"
+                )
+            st.session_state["publish_preview_signature"] = input_signature
+        except Exception as exc:
+            st.error(str(exc))
+    preview_current = (
+        st.session_state.get("publish_preview_signature") == input_signature
+    )
+    if preview_current:
+        render_preview("publish_preview")
+    elif st.session_state.get("publish_preview"):
+        st.info("Inputs changed; run Preview scan again before publishing.")
+    if st.button("Publish", disabled=not preview_current):
         progress = st.progress(0)
         log: list[str] = []
         with st.expander("Per-object log", expanded=True):
+            try:
+                ensure_publication_preflight_current(
+                    st.session_state.get("publish_preview"),
+                    dataset_id,
+                    source_path,
+                    metadata_path or None,
+                    privacy_unit_column or None,
+                    label_column or None,
+                    label_levels,
+                )
+            except Exception as exc:
+                st.session_state.pop("publish_preview_signature", None)
+                st.error(str(exc))
+                return
             try:
                 publish_dataset(
                     config, dataset_id, source_path, metadata_path,
                     privacy_unit_column, label_column or None, modality,
                     replace, progress, log.append,
-                    label_levels=[
-                        value.strip() for value in label_levels_text.split(",")
-                        if value.strip()
-                    ],
+                    label_levels=label_levels,
+                    verify_mode=verify_mode,
+                    expected_input_fingerprint=(
+                        st.session_state["publish_preview"]["input_fingerprint"]),
                 )
                 st.success("Publish complete.")
             except Exception as exc:
@@ -515,14 +765,16 @@ def render_modify_rescan(config: dict) -> None:
     if not datasets:
         st.info("No datasets found.")
         return
-    dataset_id = st.selectbox("Dataset", datasets)
+    dataset_id = st.selectbox("Dataset", datasets, key="modify-dataset")
     metadata_path = st.text_input("Replace metadata file", key="modify-metadata")
     images_path = st.text_input("Add more images path", key="modify-images")
     masks_path = st.text_input("Add more masks path", key="modify-masks")
     if st.button("Preview modify"):
         st.session_state["modify_preview"] = preview_modify(images_path, masks_path)
     render_preview("modify_preview")
-    if st.button("Apply modify"):
+    if st.button(
+            "Apply modify",
+            disabled=not any((metadata_path, images_path, masks_path))):
         log: list[str] = []
         try:
             modify_dataset(config, dataset_id, metadata_path, images_path, masks_path, log.append)
@@ -542,51 +794,120 @@ def render_delete(config: dict) -> None:
     st.header("Delete")
     s3 = make_s3_client(config)
     bucket = config["bucket"]
-    datasets = safe_dataset_rows(s3, bucket)
-    if datasets is None:
+    try:
+        current_objects = list_objects(s3, bucket, "datasets/")
+    except Exception:
+        st.error("Could not list current datasets. Check the connection and credentials.")
         return
-    if not datasets:
-        st.info("No datasets found.")
+    try:
+        all_versions = list_object_versions(s3, bucket, "datasets/")
+        version_listing_error = False
+    except Exception:
+        all_versions = []
+        version_listing_error = True
+    current_ids = _dataset_ids_from_storage_items(current_objects)
+    historical_ids = _dataset_ids_from_storage_items(all_versions)
+    dataset_ids = sorted(current_ids | historical_ids)
+    if not dataset_ids:
+        if version_listing_error:
+            st.error(
+                "Could not determine the dataset inventory because version "
+                "history could not be listed. Check storage permissions."
+            )
+        else:
+            st.info("No datasets found.")
         return
-    dataset_id = st.selectbox("Dataset to delete", [row["dataset_id"] for row in datasets])
+    dataset_id = st.selectbox(
+        "Dataset to delete", dataset_ids, key="delete-dataset")
     prefix = f"datasets/{dataset_id}/"
-    objects = list_objects(s3, bucket, prefix)
-    total_bytes = sum(obj["size"] for obj in objects)
-    derived_present = any("/derived/" in obj["key"] or "/qc/" in obj["key"] for obj in objects)
+    objects = [item for item in current_objects if item["key"].startswith(prefix)]
+    versions = [item for item in all_versions if item["key"].startswith(prefix)]
+    dry_run = st.checkbox("Dry run", value=True, key="delete-dry-run")
+    purge_versions = st.checkbox(
+        "Purge all object versions and delete markers", value=False,
+        key="delete-purge",
+        help=("Leave unchecked to preserve version history. Selecting this "
+              "performs the same irreversible action as 'dataset purge'."),
+    )
+    inventory = versions if purge_versions else objects
+    total_bytes = sum(obj.get("size", 0) for obj in inventory)
+    derived_present = any(
+        "/derived/" in obj["key"] or "/qc/" in obj["key"]
+        for obj in inventory)
     st.warning(
         "This deletes current objects under the selected dataset prefix. "
         "Enable version purging below to remove its stored history."
     )
     st.write(f"Dataset ID: **{dataset_id}**")
-    st.write(f"Total objects: **{len(objects)}**")
+    inventory_label = "stored versions/markers" if purge_versions else "current objects"
+    st.write(f"Total {inventory_label}: **{len(inventory)}**")
     st.write(f"Total bytes: **{human_bytes(total_bytes)}**")
-    st.write(f"Last modified: **{max((obj['last_modified'] for obj in objects), default='not available')}**")
+    st.write(f"Last modified: **{max((obj.get('last_modified') or '' for obj in inventory), default='not available') or 'not available'}**")
     st.write(f"Derived assets present: **{'yes' if derived_present else 'no'}**")
-    dry_run = st.checkbox("Dry run", value=True)
-    purge_versions = st.checkbox(
-        "Purge all object versions and delete markers", value=False,
-        help=("Leave unchecked to preserve version history. Equivalent to CLI "
-              "--purge-versions; purging cannot be undone."),
-    )
-    typed = st.text_input("Type the dataset ID to confirm")
+    if not objects and versions:
+        st.info(
+            "Only preserved history remains; select version purging to remove it.")
+    if version_listing_error:
+        st.warning(
+            "Version history could not be listed; irreversible purge is unavailable.")
+    typed = st.text_input(
+        "Type the dataset ID to confirm", key="delete-confirmation")
     if dry_run:
         with st.expander("Keys that would be deleted"):
-            st.code("\n".join(obj["key"] for obj in objects[:500]))
-    disabled = typed != dataset_id
+            if purge_versions:
+                st.code("\n".join(
+                    f"{obj['key']} @ {obj.get('version_id')}"
+                    + (" [delete marker]" if obj.get("is_delete_marker") else "")
+                    for obj in inventory[:500]
+                ))
+            else:
+                st.code("\n".join(obj["key"] for obj in inventory[:500]))
+            if len(inventory) > 500:
+                st.caption(
+                    f"Showing the first 500 of {len(inventory)} entries; "
+                    f"{len(inventory) - 500} omitted from this preview."
+                )
+    disabled = (
+        typed != dataset_id
+        or (not objects and not purge_versions)
+        or (purge_versions and version_listing_error)
+    )
     if st.button("Delete dataset", disabled=disabled):
-        deleted = delete_keys(s3, bucket, [obj["key"] for obj in objects]) if not dry_run else 0
-        version_deleted = 0
-        if not dry_run and purge_versions:
-            versions = list_object_versions(s3, bucket, prefix)
-            version_deleted = delete_object_versions(s3, bucket, versions)
         if dry_run:
-            st.info(f"Dry run: {len(objects)} objects would be deleted.")
+            st.info(
+                f"Dry run: {len(inventory)} {inventory_label} would be deleted.")
         else:
-            st.success(f"Deleted {deleted} objects.")
+            try:
+                if purge_versions:
+                    version_deleted = _purge_dataset(
+                        s3, bucket, dataset_id)
+                else:
+                    deleted = _delete_dataset_current(
+                        s3, bucket, dataset_id)
+            except Exception as exc:
+                st.error(str(exc))
+                return
             if purge_versions:
                 st.success(
                     f"Deleted {version_deleted} object versions/delete markers."
                 )
+            else:
+                st.success(
+                    f"Deleted {deleted} current objects; version history was preserved."
+                )
+
+
+def _dataset_ids_from_storage_items(items: list[dict]) -> set[str]:
+    dataset_ids = set()
+    for item in items:
+        parts = str(item.get("key", "")).split("/", 2)
+        if len(parts) != 3 or parts[0] != "datasets":
+            continue
+        try:
+            dataset_ids.add(validate_dataset_id(parts[1]))
+        except ValueError:
+            continue
+    return dataset_ids
 
 
 def render_controller(config: dict) -> None:
@@ -702,6 +1023,107 @@ def preview_scan(source_path: str) -> dict:
     }
 
 
+def publication_preflight(dataset_id: str, source_path: str,
+                          metadata_path: str | None,
+                          privacy_unit_column: str | None,
+                          label_column: str | None,
+                          label_levels: list[str]) -> dict:
+    """Validate every local publication input without opening S3."""
+    validate_dataset_id(dataset_id)
+    if not source_path:
+        raise ValueError("source path is required")
+    samples = scan_images(source_path)
+    if not samples:
+        raise ValueError("No image files found.")
+    masks = scan_masks(
+        source_path,
+        sample_ids=[sample["sample_id"] for sample in samples],
+    )
+    metadata_path = _publication_metadata(source_path, metadata_path)
+    metadata = read_metadata_table(metadata_path) if metadata_path else None
+    if not privacy_unit_column:
+        if metadata is not None and "patient_id" in metadata.column_names:
+            privacy_unit_column = "patient_id"
+        else:
+            raise ValueError(
+                "Could not infer the patient privacy unit; select its metadata column"
+            )
+    build_samples_metadata(
+        samples,
+        extra_metadata=metadata,
+        privacy_unit_col=privacy_unit_column,
+        label_col=label_column,
+        label_levels=label_levels,
+    )
+    input_fingerprint = _publication_input_fingerprint(
+        samples, masks, metadata_path)
+    return {
+        "images": len(samples),
+        "masks": len(masks),
+        "total_bytes": sum(sample["size"] for sample in samples + masks),
+        "sample_ids": [sample["sample_id"] for sample in samples[:20]],
+        "first_detected_file_sha256": (
+            first_file_digest(source_path) or samples[0]["content_hash"]
+        ),
+        "metadata": metadata_path,
+        "privacy_unit_column": privacy_unit_column,
+        "warnings": validate_dicom_series(source_path),
+        "input_fingerprint": input_fingerprint,
+    }
+
+
+def _publication_input_fingerprint(samples: list[dict], masks: list[dict],
+                                   metadata_path: str | None) -> str:
+    def asset(item: dict) -> dict:
+        return {
+            "sample_id": item.get("sample_id"),
+            "source_kind": item.get("source_kind"),
+            "uri_path": item.get("uri_path"),
+            "content_hash": item.get("content_hash"),
+            "size": item.get("size"),
+            "files": item.get("files"),
+        }
+
+    payload = {
+        "samples": [asset(item) for item in samples],
+        "masks": [asset(item) for item in masks],
+        "metadata_path": (
+            str(Path(metadata_path).resolve()) if metadata_path else None),
+        "metadata_sha256": sha256_file(metadata_path) if metadata_path else None,
+    }
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+
+
+def ensure_publication_preflight_current(
+    expected: dict | None,
+    dataset_id: str,
+    source_path: str,
+    metadata_path: str | None,
+    privacy_unit_column: str | None,
+    label_column: str | None,
+    label_levels: list[str],
+) -> dict:
+    """Re-scan local inputs so Publish cannot use a stale preview."""
+    if not expected:
+        raise ValueError("Run Preview scan before publishing.")
+    current = publication_preflight(
+        dataset_id,
+        source_path,
+        metadata_path,
+        privacy_unit_column,
+        label_column,
+        label_levels,
+    )
+    if current["input_fingerprint"] != expected.get("input_fingerprint"):
+        raise ValueError(
+            "Local images, masks or metadata changed after Preview scan; "
+            "review the updated inputs before publishing."
+        )
+    return current
+
+
 def preview_modify(images_path: str, masks_path: str) -> dict:
     samples = scan_images(images_path) if images_path else []
     masks = scan_masks(masks_path, sample_ids=[sample["sample_id"] for sample in samples]) if masks_path else []
@@ -718,7 +1140,9 @@ def publish_dataset(config: dict, dataset_id: str, source_path: str, metadata_pa
                     privacy_unit_column: str, label_column: str | None,
                     modality: str, replace: bool, progress,
                     log: Callable[[str], None], *,
-                    label_levels: list[str] | None = None) -> None:
+                    label_levels: list[str] | None = None,
+                    verify_mode: str = "quick",
+                    expected_input_fingerprint: str | None = None) -> None:
     validate_dataset_id(dataset_id)
     s3 = make_s3_client(config)
     bucket = config["bucket"]
@@ -733,52 +1157,46 @@ def publish_dataset(config: dict, dataset_id: str, source_path: str, metadata_pa
     for warning in validate_dicom_series(source_path):
         log(f"WARN: {warning}")
     masks = scan_masks(source_path, sample_ids=[sample["sample_id"] for sample in samples])
+    metadata_path = _publication_metadata(source_path, metadata_path or None)
     extra_metadata = read_metadata_table(metadata_path) if metadata_path else None
+    observed_fingerprint = _publication_input_fingerprint(
+        samples, masks, metadata_path)
+    if (expected_input_fingerprint is not None
+            and observed_fingerprint != expected_input_fingerprint):
+        raise ValueError(
+            "Local images, masks or metadata changed after Preview scan; "
+            "review the updated inputs before publishing."
+        )
+    if not privacy_unit_column:
+        if extra_metadata is not None and "patient_id" in extra_metadata.column_names:
+            privacy_unit_column = "patient_id"
+        else:
+            raise ValueError(
+                "Could not infer the patient privacy unit; select its metadata column"
+            )
     build_samples_metadata(
         samples, extra_metadata=extra_metadata,
         privacy_unit_col=privacy_unit_column, label_col=label_column,
         label_levels=label_levels,
     )
-    # Atomic replacements must stage the complete source set.
-    sample_uploads = samples
-    mask_uploads = masks
-    log(f"Images to upload: {len(sample_uploads)}")
-    log(f"Masks to upload: {len(mask_uploads)}")
-    transaction = _atomic_upload_sources(
-        s3, bucket, prefix, sample_uploads, mask_uploads, replace=replace,
-        require_empty=not replace,
+    log(f"Images to upload: {len(samples)}")
+    log(f"Masks to upload: {len(masks)}")
+    _publish_dataset_atomic(
+        s3, bucket, dataset_id, samples, masks,
+        extra_metadata=extra_metadata,
+        privacy_unit_col=privacy_unit_column,
+        label_col=label_column,
+        label_levels=label_levels,
+        modality=modality,
+        replace=replace,
+        verify_mode=verify_mode,
     )
-    try:
-        transaction["mutated"] = True
-        published_objects = list_objects(
-            s3, bucket, f"{prefix}/source/images/", include_version_ids=True)
-        published_mask_objects = list_objects(
-            s3, bucket, f"{prefix}/source/masks/", include_version_ids=True)
-        published_samples = scan_s3_images(
-            s3, bucket, prefix, published_objects)
-        published_masks = scan_s3_masks(
-            s3, bucket, prefix, published_mask_objects,
-            sample_ids=[sample["sample_id"] for sample in published_samples],
-        )
-        _write_dataset_artifacts(
-            s3, bucket, prefix, dataset_id, modality,
-            published_samples, published_masks,
-            extra_metadata, privacy_unit_col=privacy_unit_column,
-            expected_images=published_objects,
-            expected_masks=published_mask_objects,
-            label_col=label_column,
-            label_levels=label_levels,
-            publish_lock=transaction["publish_lock"],
-        )
-    except Exception:
-        _finish_atomic_publish(s3, bucket, prefix, transaction, commit=False)
-        raise
+    if progress is not None:
+        progress.progress(1.0)
+    if verify_mode == "none":
+        log("manifest and indexes uploaded; verification skipped (explicit none)")
     else:
-        if not _finish_atomic_publish(
-                s3, bucket, prefix, transaction, commit=True):
-            raise RuntimeError("dataset publication lock ownership was lost")
-    progress.progress(1.0)
-    log("manifest and indexes uploaded")
+        log(f"manifest and indexes uploaded; {verify_mode} verification complete")
 
 
 def modify_dataset(config: dict, dataset_id: str, metadata_path: str,
@@ -802,10 +1220,10 @@ def modify_dataset(config: dict, dataset_id: str, metadata_path: str,
             sample["sample_id"] for sample in image_uploads
         ],
     ) if masks_path else []
-    extra_metadata = (
-        read_metadata_table(metadata_path) if metadata_path
-        else _read_existing_samples_metadata(s3, bucket, prefix)
-    )
+    # Existing metadata must be read by _rescan_dataset_artifacts only after
+    # the publication lock is held; otherwise a queued modify can overwrite a
+    # newer metadata update with a stale pre-lock snapshot.
+    extra_metadata = read_metadata_table(metadata_path) if metadata_path else None
     transaction = _atomic_upload_sources(
         s3, bucket, prefix, image_uploads, masks, replace=False)
     try:
@@ -901,6 +1319,12 @@ def render_preview(key: str) -> None:
     st.write("First detected sample IDs")
     st.write(", ".join(preview["sample_ids"]) or "none")
     st.write(f"First detected file SHA-256: `{preview['first_detected_file_sha256']}`")
+    if preview.get("metadata"):
+        st.write(f"Metadata: `{preview['metadata']}`")
+    if preview.get("privacy_unit_column"):
+        st.write(f"Privacy unit column: `{preview['privacy_unit_column']}`")
+    for warning in preview.get("warnings", []):
+        st.warning(warning)
 
 
 def render_parquet_preview(s3, bucket: str, key: str, title: str) -> None:
@@ -958,12 +1382,14 @@ def manifest_modality(s3, bucket: str, prefix: str) -> str:
 
 def resource_block(config: dict, dataset_id: str) -> str:
     endpoint = config.get("endpoint", "")
+    validate_s3_endpoint(endpoint or None)
     bucket = config.get("bucket", "")
     region = config.get("region", "")
     prefix = f"datasets/{dataset_id}"
-    query = f"endpoint={endpoint}&bucket={bucket}&prefix={prefix}"
+    parameters = {"endpoint": endpoint, "bucket": bucket, "prefix": prefix}
     if region:
-        query += f"&region={region}"
+        parameters["region"] = region
+    query = requests.compat.urlencode(parameters)
     return yaml.safe_dump({
         "name": dataset_id,
         "url": f"imaging+dataset://{dataset_id}?{query}",
@@ -1022,8 +1448,10 @@ def sqs_depth(config: dict) -> dict:
     if not queue_url:
         return {"configured": False}
     try:
-        sqs = st.session_state.get("_sqs_client") or boto3.client(
-            "sqs", region_name=config.get("region") or None
+        sqs = st.session_state.get("_sqs_client") or create_sqs_client(
+            config.get("access_key"),
+            config.get("secret_key"),
+            config.get("region") or "",
         )
         attrs = sqs.get_queue_attributes(
             QueueUrl=queue_url,
@@ -1127,8 +1555,10 @@ def _sqs_policy_check(config: dict) -> tuple[str, str]:
     queue_url = config.get("sqs_queue_url")
     if not queue_url:
         return "warn", "SQS queue URL is not set"
-    sqs = st.session_state.get("_sqs_client") or boto3.client(
-        "sqs", region_name=config.get("region") or None
+    sqs = st.session_state.get("_sqs_client") or create_sqs_client(
+        config.get("access_key"),
+        config.get("secret_key"),
+        config.get("region") or "",
     )
     attrs = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["Policy"]).get("Attributes", {})
     policy = attrs.get("Policy", "")

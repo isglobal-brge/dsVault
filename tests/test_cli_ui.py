@@ -163,22 +163,26 @@ class UiCliTests(unittest.TestCase):
         calls = []
         fake_ui = types.ModuleType("dsimaging_admin.ui")
 
-        def launch_ui(host, port, open_browser):
-            calls.append((host, port, open_browser))
+        def launch_ui(host, port, open_browser, environment):
+            calls.append((host, port, open_browser, environment))
 
         fake_ui.launch_ui = launch_ui
         with patch.dict(sys.modules, {"dsimaging_admin.ui": fake_ui}):
             result = CliRunner().invoke(main, ["ui"])
 
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertEqual(calls, [("127.0.0.1", 8501, False)])
+        self.assertEqual(calls[0][:3], ("127.0.0.1", 8501, False))
+        self.assertNotIn("DSIMAGING_ACCESS_KEY", calls[0][3])
+        self.assertNotIn("DSIMAGING_SECRET_KEY", calls[0][3])
+        self.assertNotIn("DSIMAGING_CONTROLLER_TOKEN", calls[0][3])
+        self.assertNotIn("DSIMAGING_ENDPOINT", calls[0][3])
 
     def test_ui_group_refuses_non_loopback_bind(self):
         calls = []
         fake_ui = types.ModuleType("dsimaging_admin.ui")
 
-        def launch_ui(host, port, open_browser):
-            calls.append((host, port, open_browser))
+        def launch_ui(host, port, open_browser, environment):
+            calls.append((host, port, open_browser, environment))
 
         fake_ui.launch_ui = launch_ui
         with patch.dict(sys.modules, {"dsimaging_admin.ui": fake_ui}):

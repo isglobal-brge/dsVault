@@ -3,21 +3,25 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import secrets
 import shutil
 import subprocess
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, asdict
+from functools import wraps
 from pathlib import Path
+
+from filelock import FileLock
 
 from .controller import ControllerError, health
 from .s3 import create_client
 
 
 DEFAULT_CONTROLLER_IMAGE = (
-    "davidsarrat/dsimaging-store:0.3.10@"
-    "sha256:0aae2ed2870c4f6e193c4878cd8162eb434990c7a7f79d5a8cc491ceb4f76f7a"
+    "davidsarrat/dsimaging-store:0.3.11@"
+    "sha256:d7aed1412f25050f0495278ed393d555ef29d06ace6df634110c2794cb9295fc"
 )
 DEFAULT_MINIO_IMAGE = (
     "minio/minio:RELEASE.2025-09-07T16-13-09Z@"
@@ -54,6 +58,39 @@ class StoreConfig:
         return data
 
 
+_PROJECT_LOCK_STATE = threading.local()
+
+
+@contextmanager
+def store_project_lock(path: str | Path):
+    """Serialize lifecycle operations for one canonical store path."""
+    root = Path(path).expanduser().resolve()
+    root.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = str(root.parent / f".{root.name}.dsimaging-store.lock")
+    held = getattr(_PROJECT_LOCK_STATE, "paths", set())
+    if lock_path in held:
+        yield root
+        return
+    with FileLock(lock_path, mode=0o600):
+        held = set(held)
+        held.add(lock_path)
+        _PROJECT_LOCK_STATE.paths = held
+        try:
+            yield root
+        finally:
+            held.remove(lock_path)
+            _PROJECT_LOCK_STATE.paths = held
+
+
+def _with_store_project_lock(function):
+    @wraps(function)
+    def locked(dest, *args, **kwargs):
+        with store_project_lock(dest):
+            return function(dest, *args, **kwargs)
+    return locked
+
+
+@_with_store_project_lock
 def init_store(
     dest: str,
     *,
@@ -156,24 +193,83 @@ def init_store(
 
 def load_store_config(path: str) -> StoreConfig:
     root = Path(path).expanduser().resolve()
+    required_files = (".env", "docker-compose.yml", "init-bucket.sh")
+    file_problems = []
+    if not root.is_dir():
+        file_problems.append("project path is not a directory")
+    for name in required_files:
+        artifact = root / name
+        if artifact.is_symlink():
+            file_problems.append(f"{name} is a symbolic link")
+        elif not artifact.exists():
+            file_problems.append(f"{name} is missing")
+        elif not artifact.is_file():
+            file_problems.append(f"{name} is not a regular file")
+    if file_problems:
+        raise ValueError(
+            f"{root} is not a dsimaging-store project: a complete generated "
+            "project requires docker-compose.yml/.env and init-bucket.sh; "
+            + "; ".join(file_problems)
+        )
+
     env = _read_env(root / ".env")
-    minio_port = int(env.get("MINIO_PORT", "9000"))
-    controller_port = int(env.get("CONTROLLER_PORT", "8080"))
+    required_values = (
+        "MINIO_ROOT_USER",
+        "MINIO_ROOT_PASSWORD",
+        "MINIO_PORT",
+        "MINIO_CONSOLE_PORT",
+        "CONTROLLER_PORT",
+        "BUCKET_NAME",
+        "DSIMAGING_CONTROLLER_TOKEN",
+        "DSIMAGING_WEBHOOK_TOKEN",
+    )
+    missing = [key for key in required_values if not env.get(key)]
+    if missing:
+        raise ValueError(
+            f"{root / '.env'} is missing required generated value(s): "
+            f"{', '.join(missing)}; review the existing settings and explicitly "
+            "migrate the project with 'dsimaging-admin store init <path> --force'"
+        )
+
+    ports = {}
+    for key in ("MINIO_PORT", "MINIO_CONSOLE_PORT", "CONTROLLER_PORT"):
+        try:
+            value = int(env[key])
+        except ValueError as exc:
+            raise ValueError(f"{key} must be an integer between 1 and 65535") from exc
+        if not 1 <= value <= 65535:
+            raise ValueError(f"{key} must be an integer between 1 and 65535")
+        ports[key] = value
+    if len(set(ports.values())) != len(ports):
+        raise ValueError("store service ports must be distinct")
+
+    _safe_env_value("MinIO access key", env["MINIO_ROOT_USER"], min_length=3)
+    _safe_env_value("MinIO secret key", env["MINIO_ROOT_PASSWORD"], min_length=8)
+    _safe_env_value("controller token", env["DSIMAGING_CONTROLLER_TOKEN"], min_length=16)
+    _safe_env_value("webhook token", env["DSIMAGING_WEBHOOK_TOKEN"], min_length=16)
+    bucket = env["BUCKET_NAME"]
+    if (not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket) or
+            ".." in bucket or ".-" in bucket or "-." in bucket):
+        raise ValueError("BUCKET_NAME must be a canonical S3 bucket name")
+
+    minio_port = ports["MINIO_PORT"]
+    controller_port = ports["CONTROLLER_PORT"]
     return StoreConfig(
         path=str(root),
         endpoint=f"http://127.0.0.1:{minio_port}",
         controller_url=f"http://127.0.0.1:{controller_port}",
-        controller_token=env.get("DSIMAGING_CONTROLLER_TOKEN", ""),
-        webhook_token=env.get("DSIMAGING_WEBHOOK_TOKEN", ""),
-        bucket=env.get("BUCKET_NAME", "imaging-data"),
-        access_key=env.get("MINIO_ROOT_USER", ""),
-        secret_key=env.get("MINIO_ROOT_PASSWORD", ""),
+        controller_token=env["DSIMAGING_CONTROLLER_TOKEN"],
+        webhook_token=env["DSIMAGING_WEBHOOK_TOKEN"],
+        bucket=bucket,
+        access_key=env["MINIO_ROOT_USER"],
+        secret_key=env["MINIO_ROOT_PASSWORD"],
         minio_port=minio_port,
-        console_port=int(env.get("MINIO_CONSOLE_PORT", "9001")),
+        console_port=ports["MINIO_CONSOLE_PORT"],
         controller_port=controller_port,
     )
 
 
+@_with_store_project_lock
 def compose_up(path: str, build: bool = True) -> str:
     cmd = _compose_cmd(path) + ["up", "-d"]
     if build:
@@ -181,6 +277,7 @@ def compose_up(path: str, build: bool = True) -> str:
     return _run(cmd, cwd=path)
 
 
+@_with_store_project_lock
 def compose_down(path: str, volumes: bool = False) -> str:
     cmd = _compose_cmd(path) + ["down"]
     if volumes:
@@ -219,16 +316,81 @@ def store_doctor(path: str) -> dict:
     except (ControllerError, Exception) as e:
         result["controller"] = {"ok": False, "error": str(e)}
 
+    s3_result = {"ok": False, "bucket": cfg.bucket}
     try:
         s3 = create_client(cfg.endpoint, cfg.access_key, cfg.secret_key, "")
         s3.head_bucket(Bucket=cfg.bucket)
-        result["s3"] = {"ok": True, "bucket": cfg.bucket}
     except Exception as e:
-        result["s3"] = {"ok": False, "bucket": cfg.bucket, "error": str(e)}
+        s3_result["error"] = str(e)
+    else:
+        failures = []
+        try:
+            status = s3.get_bucket_versioning(Bucket=cfg.bucket).get(
+                "Status", "Disabled")
+            versioning_ok = status == "Enabled"
+            s3_result["versioning"] = {"ok": versioning_ok, "status": status}
+            if not versioning_ok:
+                failures.append(f"bucket versioning is {status}")
+        except Exception as e:
+            s3_result["versioning"] = {
+                "ok": False, "status": "unknown", "error": str(e),
+            }
+            failures.append(f"bucket versioning check failed: {e}")
+
+        try:
+            notification = s3.get_bucket_notification_configuration(
+                Bucket=cfg.bucket)
+            notification_ok = _has_generated_webhook_notification(notification)
+            s3_result["notification"] = {
+                "ok": notification_ok,
+                "target": "arn:minio:sqs::DSIMAGING:webhook",
+                "prefix": "datasets/",
+            }
+            if not notification_ok:
+                failures.append("generated webhook notification is missing or invalid")
+        except Exception as e:
+            s3_result["notification"] = {"ok": False, "error": str(e)}
+            failures.append(f"webhook notification check failed: {e}")
+
+        try:
+            s3.head_object(Bucket=cfg.bucket, Key="datasets/.keep")
+            s3_result["init_marker"] = {
+                "ok": True, "key": "datasets/.keep",
+            }
+        except Exception as e:
+            s3_result["init_marker"] = {
+                "ok": False, "key": "datasets/.keep", "error": str(e),
+            }
+            failures.append("init marker datasets/.keep is missing or inaccessible")
+
+        s3_result["ok"] = not failures
+        if failures:
+            s3_result["error"] = "; ".join(failures)
+    result["s3"] = s3_result
     result["ok"] = all(
         result[name].get("ok") for name in ("docker", "controller", "s3")
     )
     return result
+
+
+def _has_generated_webhook_notification(config: dict) -> bool:
+    for item in config.get("QueueConfigurations", []):
+        if item.get("QueueArn") != "arn:minio:sqs::DSIMAGING:webhook":
+            continue
+        events = [event for event in item.get("Events", [])
+                  if isinstance(event, str)]
+        if not (any(event.startswith("s3:ObjectCreated:") for event in events)
+                and any(event.startswith("s3:ObjectRemoved:") for event in events)):
+            continue
+        rules = item.get("Filter", {}).get("Key", {}).get("FilterRules", [])
+        if any(
+            str(rule.get("Name", "")).lower() == "prefix"
+            and rule.get("Value") == "datasets/"
+            for rule in rules
+            if isinstance(rule, dict)
+        ):
+            return True
+    return False
 
 
 def _compose_cmd(path: str) -> list[str]:
@@ -236,6 +398,22 @@ def _compose_cmd(path: str) -> list[str]:
         raise RuntimeError("docker command not found")
     root = Path(path).expanduser().resolve()
     return ["docker", "compose", "--project-directory", str(root)]
+
+
+def check_compose_prerequisites() -> None:
+    """Fail before project generation when Docker Compose is unavailable."""
+    if not shutil.which("docker"):
+        raise RuntimeError("docker command not found")
+    proc = subprocess.run(
+        ["docker", "compose", "version"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            proc.stdout.strip() or "docker compose is not available")
 
 
 def _run(cmd: list[str], cwd: str) -> str:

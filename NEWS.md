@@ -1,5 +1,33 @@
 # NEWS
 
+## 0.3.13
+
+- `store setup PATH` now provides the normal idempotent local workflow: it
+  checks Docker Compose before writing files, starts and fully diagnoses the
+  deployment, then stores only a private-project pointer in the active profile.
+- Named non-secret profiles, pathless local lifecycle commands, path-free AWS
+  provisioning, and positional `dataset publish DATASET_ID SOURCE` keep the
+  common path short while retaining the advanced commands.
+- Publication now verifies under the exact owned lock before commit, rejects
+  source/metadata drift (including mid-upload changes), and cleans visible
+  staging objects without requiring version-history permissions.
+- Ordinary deletion requires versioning and preserves history; irreversible
+  purge has a separate command and two explicit confirmations. Object-version
+  batches are fully validated before their first deletion.
+- UI credentials are scoped to the selected profile and endpoint, local-store
+  secrets are resolved only server-side, AWS S3/SQS use the same credential
+  source, and stale publication, modification, or destructive confirmation
+  state cannot cross profile/endpoint/bucket boundaries.
+- Endpoint and controller URLs reject embedded credentials; controller tokens
+  never follow an endpoint override implicitly. Concurrent profile updates are
+  serialized and all configuration output remains redacted.
+- Mutating Compose operations are serialized per owned local project. AWS
+  event queues use collision-resistant bucket identities and migrate the
+  managed S3 notification from legacy queue names without disturbing unrelated
+  notification routes.
+- Store doctor checks versioning, initialization and the exact generated event
+  route, while malformed/partial projects fail closed.
+
 ## 0.3.12
 
 - Configuration now honors `default_profile` when no explicit profile or

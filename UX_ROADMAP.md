@@ -1,8 +1,8 @@
 # dsimaging-admin UX roadmap
 
-This document defines the proposed operator experience for the next feature
-release. It is a plan, not the current command contract. Existing commands and
-flags remain supported until each proposal below is implemented and tested.
+This document records the operator contract implemented for the 0.3.13 feature
+release and the smaller UI consolidation planned for a later iteration.
+Existing commands and flags remain supported where noted below.
 
 ## Goals
 
@@ -17,7 +17,7 @@ flags remain supported until each proposal below is implemented and tested.
 - Advanced controls remain available through explicit flags and profiles,
   outside the common path.
 
-## Proposed command surface
+## Command surface
 
 ```text
 dsimaging-admin
@@ -123,7 +123,7 @@ The AWS operation uses the existing complete bucket/versioning/encryption/SQS
 provisioner. Custom endpoints are never mistaken for a request to create a
 local Compose project.
 
-## Operator UI
+## Next UI iteration
 
 The seven current pages should become four task-focused views:
 

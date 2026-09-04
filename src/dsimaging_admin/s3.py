@@ -1,5 +1,6 @@
 """S3/MinIO client helpers."""
 
+import hashlib
 import json
 import re
 
@@ -7,6 +8,36 @@ import boto3
 from botocore.exceptions import ClientError
 from botocore.config import Config
 from urllib.parse import urlparse
+
+
+def validate_s3_endpoint(endpoint: str | None) -> str | None:
+    """Validate an endpoint URL without allowing embedded credentials."""
+    if endpoint is None or endpoint == "":
+        return endpoint
+    if not isinstance(endpoint, str) or endpoint.strip() != endpoint:
+        raise ValueError("S3 endpoint must be a canonical HTTP(S) URL")
+    try:
+        parsed = urlparse(endpoint)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("S3 endpoint must be a canonical HTTP(S) URL") from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or port is not None and not 1 <= port <= 65535
+        or any(char in endpoint for char in ("\r", "\n", "\t"))
+        or any(part in {".", ".."} for part in parsed.path.split("/"))
+    ):
+        raise ValueError(
+            "S3 endpoint must be an HTTP(S) URL without credentials, "
+            "query parameters, fragments or dot segments"
+        )
+    return endpoint
 
 
 def is_native_aws_s3_endpoint(endpoint: str | None) -> bool:
@@ -37,6 +68,16 @@ def is_native_aws_s3_endpoint(endpoint: str | None) -> bool:
     ) is not None
 
 
+def is_loopback_s3_endpoint(endpoint: str | None) -> bool:
+    """Return whether an endpoint is explicitly bound to this host."""
+    if not isinstance(endpoint, str) or not endpoint:
+        return False
+    try:
+        return urlparse(endpoint).hostname in {"localhost", "127.0.0.1", "::1"}
+    except ValueError:
+        return False
+
+
 def detect_backend(endpoint: str | None, override: str = "auto") -> tuple[str, str]:
     """Return ``(backend, rationale)`` for an endpoint and optional override."""
     if override and override != "auto":
@@ -64,6 +105,7 @@ def create_client(endpoint: str | None, access_key: str | None = None,
     For MinIO (IP/localhost endpoints), region defaults to "us-east-1"
     as a dummy value that boto3 accepts.
     """
+    endpoint = validate_s3_endpoint(endpoint)
     effective_region = region if region else "us-east-1"
     kwargs = {"region_name": effective_region}
     if endpoint:
@@ -260,37 +302,48 @@ def list_object_versions(s3, bucket: str, prefix: str) -> list[dict]:
                 "key": obj["Key"],
                 "version_id": obj.get("VersionId"),
                 "is_delete_marker": False,
+                "size": int(obj.get("Size", 0)),
+                "last_modified": (
+                    obj["LastModified"].isoformat()
+                    if obj.get("LastModified") else None),
             })
         for obj in page.get("DeleteMarkers", []):
             versions.append({
                 "key": obj["Key"],
                 "version_id": obj.get("VersionId"),
                 "is_delete_marker": True,
+                "size": 0,
+                "last_modified": (
+                    obj["LastModified"].isoformat()
+                    if obj.get("LastModified") else None),
             })
     return versions
 
 
 def delete_object_versions(s3, bucket: str, versions: list[dict]) -> int:
     """Delete explicit S3 object versions/delete markers in batches."""
+    objects = []
+    for index, item in enumerate(versions):
+        if (not isinstance(item, dict) or not item.get("key")
+                or not item.get("version_id")):
+            raise ValueError(
+                f"S3 version entry at index {index} requires non-empty "
+                "Key and VersionId values"
+            )
+        objects.append({"Key": item["key"], "VersionId": item["version_id"]})
+
     deleted = 0
-    for i in range(0, len(versions), 1000):
-        chunk = versions[i:i + 1000]
-        objects = [
-            {"Key": item["key"], "VersionId": item["version_id"]}
-            for item in chunk
-            if item.get("version_id")
-        ]
-        if not objects:
-            continue
+    for i in range(0, len(objects), 1000):
+        chunk = objects[i:i + 1000]
         resp = s3.delete_objects(
             Bucket=bucket,
-            Delete={"Objects": objects, "Quiet": True},
+            Delete={"Objects": chunk, "Quiet": True},
         )
         errors = resp.get("Errors", [])
         if errors:
             raise RuntimeError(
                 f"S3 version deletion failed for {len(errors)} item(s)")
-        deleted += len(objects)
+        deleted += len(chunk)
     return deleted
 
 
@@ -387,7 +440,10 @@ def _encryption_matches(current: dict, desired: dict) -> bool:
 
 def _event_queue_name(bucket: str) -> str:
     safe_bucket = re.sub(r"[^A-Za-z0-9_-]", "-", bucket)
-    return f"dsimaging-store-{safe_bucket}-events"[:80]
+    digest = hashlib.sha256(bucket.encode("utf-8")).hexdigest()[:12]
+    fixed = f"dsimaging-store--events-{digest}"
+    safe_bucket = safe_bucket[:80 - len(fixed)]
+    return f"dsimaging-store-{safe_bucket}-events-{digest}"
 
 
 def _ensure_sqs_queue(sqs, queue_name: str) -> tuple[str, str, bool]:
@@ -418,7 +474,9 @@ def _ensure_sqs_policy(sqs, queue_url: str, queue_arn: str, bucket: str) -> bool
     if isinstance(statements, dict):
         statements = [statements]
         policy["Statement"] = statements
-    sid = f"DsimagingStoreS3Events{re.sub(r'[^A-Za-z0-9]', '', bucket)[:40]}"
+    safe_bucket = re.sub(r"[^A-Za-z0-9]", "", bucket)[:32]
+    digest = hashlib.sha256(bucket.encode("utf-8")).hexdigest()[:12]
+    sid = f"DsimagingStoreS3Events{safe_bucket}{digest}"
     statement = {
         "Sid": sid,
         "Effect": "Allow",
@@ -460,22 +518,24 @@ def _load_policy(raw: str | None) -> dict:
 def _ensure_bucket_notification(s3, bucket: str, queue_arn: str) -> bool:
     current = s3.get_bucket_notification_configuration(Bucket=bucket)
     notification = _clean_notification_config(current)
+    current_queues = notification.get("QueueConfigurations", [])
+    managed = [
+        item for item in current_queues
+        if (item.get("QueueArn") == queue_arn
+            or item.get("Id") == "dsimaging-store-events")
+    ]
     queues = [
-        item for item in notification.get("QueueConfigurations", [])
-        if item.get("QueueArn") != queue_arn
+        item for item in current_queues
+        if (item.get("QueueArn") != queue_arn
+            and item.get("Id") != "dsimaging-store-events")
     ]
     desired = {
         "Id": "dsimaging-store-events",
         "QueueArn": queue_arn,
         "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
     }
-    if len(queues) != len(notification.get("QueueConfigurations", [])):
-        existing = [
-            item for item in notification.get("QueueConfigurations", [])
-            if item.get("QueueArn") == queue_arn
-        ][0]
-        if _queue_notification_matches(existing, desired):
-            return False
+    if len(managed) == 1 and _queue_notification_matches(managed[0], desired):
+        return False
     queues.append(desired)
     notification["QueueConfigurations"] = queues
     s3.put_bucket_notification_configuration(

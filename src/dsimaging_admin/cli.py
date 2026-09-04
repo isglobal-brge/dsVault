@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
+import time
 import uuid
+from functools import wraps
 from pathlib import Path
+from urllib.parse import urlparse
 
 import click
+from filelock import FileLock
 
 from . import __version__
 from . import controller as controller_api
@@ -27,6 +32,7 @@ from .s3 import (
     list_objects,
     provision_aws_store,
     put_object_bytes,
+    validate_s3_endpoint,
 )
 from .manifest import (
     build_hash_index,
@@ -47,23 +53,37 @@ from .manifest import (
 )
 from .store import (
     DEFAULT_CONTROLLER_IMAGE,
+    check_compose_prerequisites,
     compose_down,
     compose_logs,
     compose_ps,
     compose_up,
     init_store,
     load_store_config,
+    store_project_lock,
     store_doctor,
 )
 from .verify import verify_dataset
 
 
-CONFIG_PATH = os.path.expanduser("~/.dsimaging.yaml")
+DEFAULT_CONFIG_PATH = os.path.expanduser("~/.dsimaging.yaml")
+CONFIG_PATH = DEFAULT_CONFIG_PATH
 PUBLISH_LOCK = ".publish-lock"
 
 
+def _config_path(config_path: str | None = None) -> str:
+    """Resolve the config path while preserving explicit/test overrides."""
+    if config_path:
+        return os.path.expanduser(config_path)
+    if CONFIG_PATH != DEFAULT_CONFIG_PATH:
+        return CONFIG_PATH
+    return os.path.expanduser(
+        os.environ.get("DSIMAGING_CONFIG") or CONFIG_PATH
+    )
+
+
 def _load_all_config(config_path: str | None = None) -> dict:
-    config_path = config_path or CONFIG_PATH
+    config_path = _config_path(config_path)
     if not os.path.exists(config_path):
         return {}
     try:
@@ -130,23 +150,95 @@ def _load_config(profile: str | None = None) -> dict:
     return _load_profile(profile)[1]
 
 
-def _write_config_profile(profile: str, values: dict, set_default: bool = True) -> None:
-    data = _load_all_config()
-    if "profiles" not in data:
-        existing = data.get("default", data) if data else {}
-        data = {"profiles": {}}
-        if existing:
-            data["profiles"]["default"] = existing
-    data.setdefault("profiles", {})[profile] = values
-    if set_default:
-        data["default_profile"] = profile
-    _write_config(data)
+def _hydrate_local_store_profile(config: dict) -> dict:
+    """Resolve a local-store pointer without persisting its secrets."""
+    config = dict(config)
+    if config.get("kind") != "local-store":
+        return config
+    store_path = config.get("store_path")
+    if not isinstance(store_path, str) or not store_path.strip():
+        raise click.ClickException(
+            "A local-store profile requires a non-empty store_path"
+        )
+    try:
+        store = load_store_config(store_path)
+    except Exception as exc:
+        raise click.ClickException(
+            f"Could not load local store project {store_path}: {exc}"
+        ) from exc
+    local_values = {
+        "backend": "minio",
+        "endpoint": store.endpoint,
+        "bucket": store.bucket,
+        "access_key": store.access_key,
+        "secret_key": store.secret_key,
+        "region": "",
+        "controller_url": store.controller_url,
+        "controller_token": store.controller_token,
+    }
+    local_values.update({
+        key: value for key, value in config.items()
+        if (not str(key).startswith("_local_")
+            and key not in {"access_key", "secret_key", "controller_token"})
+    })
+    # These provenance sentinels always describe the generated store and must
+    # never be forgeable through editable profile YAML.
+    local_values["_local_endpoint"] = store.endpoint
+    local_values["_local_controller_url"] = store.controller_url
+    local_values["store_path"] = store.path
+    return local_values
+
+
+def _config_lock(config_path: str | None = None) -> FileLock:
+    path = Path(_config_path(config_path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return FileLock(f"{path}.lock", mode=0o600)
+
+
+def _write_config_profile(profile: str, values: dict, set_default: bool = True,
+                          *, replace: bool = True,
+                          allow_same: bool = False) -> None:
+    try:
+        validate_s3_endpoint(values.get("endpoint"))
+        _validate_controller_url(values.get("controller_url"))
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    with _config_lock():
+        data = _load_all_config()
+        if data.get("profiles") is not None and not isinstance(
+                data.get("profiles"), dict):
+            raise click.ClickException("Configuration 'profiles' must be a mapping")
+        if "profiles" not in data:
+            if "default" in data:
+                existing = data.get("default") or {}
+            else:
+                existing = {
+                    key: value for key, value in data.items()
+                    if key != "default_profile"
+                }
+            if not isinstance(existing, dict):
+                raise click.ClickException(
+                    "Configuration profile 'default' must contain a mapping"
+                )
+            data = {"profiles": {}}
+            if existing:
+                data["profiles"]["default"] = existing
+        profiles = data.setdefault("profiles", {})
+        if (profile in profiles and not replace
+                and not (allow_same and profiles[profile] == values)):
+            raise click.ClickException(
+                f"Configuration profile '{profile}' already exists; use --replace"
+            )
+        profiles[profile] = values
+        if set_default:
+            data["default_profile"] = profile
+        _write_config(data)
 
 
 def _write_config(data: dict, config_path: str | None = None) -> None:
     import yaml
 
-    config_path = Path(config_path or CONFIG_PATH)
+    config_path = Path(_config_path(config_path))
     config_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(
         prefix=f".{config_path.name}.", dir=config_path.parent, text=True)
@@ -210,45 +302,213 @@ def _persist_aws_queue_url(profile: str, queue_url: str, bucket: str | None = No
                            region: str | None = None,
                            endpoint: str | None = None,
                            config_path: str | None = None) -> None:
-    data = _load_all_config(config_path)
-    if "profiles" in data and isinstance(data["profiles"], dict):
-        profiles = data.setdefault("profiles", {})
-        profile_name = profile or data.get("default_profile") or "default"
-        target = profiles.get(profile_name)
-        if target is None:
-            target = {}
-            profiles[profile_name] = target
-        elif not isinstance(target, dict):
+    try:
+        validate_s3_endpoint(endpoint)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    with _config_lock(config_path):
+        data = _load_all_config(config_path)
+        if data.get("profiles") is not None and not isinstance(
+                data.get("profiles"), dict):
+            raise click.ClickException("Configuration 'profiles' must be a mapping")
+        if "profiles" in data and isinstance(data["profiles"], dict):
+            profiles = data.setdefault("profiles", {})
+            profile_name = profile or data.get("default_profile") or "default"
+            target = profiles.get(profile_name)
+            if target is None:
+                target = {}
+                profiles[profile_name] = target
+            elif not isinstance(target, dict):
+                raise click.ClickException(
+                    f"Configuration profile '{profile_name}' must contain a mapping"
+                )
+            data.setdefault("default_profile", profile_name)
+        else:
+            profile_name = profile or "default"
+            existing = data.get("default", data) if data else {}
+            data = {
+                "default_profile": profile_name,
+                "profiles": {profile_name: existing},
+            }
+            target = data["profiles"][profile_name]
+        target["backend"] = "aws"
+        if bucket:
+            target["bucket"] = bucket
+        if region:
+            target["region"] = region
+        if endpoint:
+            target["endpoint"] = endpoint
+        aws = target.get("aws")
+        if aws is None:
+            aws = {}
+            target["aws"] = aws
+        elif not isinstance(aws, dict):
             raise click.ClickException(
-                f"Configuration profile '{profile_name}' must contain a mapping"
+                f"Configuration profile '{profile_name}' has an invalid AWS section"
             )
-        data.setdefault("default_profile", profile_name)
-    else:
-        profile_name = profile or "default"
-        existing = data.get("default", data) if data else {}
-        data = {"default_profile": profile_name, "profiles": {profile_name: existing}}
-        target = data["profiles"][profile_name]
-    target["backend"] = "aws"
-    if bucket:
-        target["bucket"] = bucket
-    if region:
-        target["region"] = region
-    if endpoint:
-        target["endpoint"] = endpoint
-    aws = target.get("aws")
-    if aws is None:
-        aws = {}
-        target["aws"] = aws
-    elif not isinstance(aws, dict):
-        raise click.ClickException(
-            f"Configuration profile '{profile_name}' has an invalid AWS section"
-        )
-    aws["sqs_queue_url"] = queue_url
-    _write_config(data, config_path)
+        aws["sqs_queue_url"] = queue_url
+        _write_config(data, config_path)
 
 
 def _echo_json(payload: dict | list) -> None:
     click.echo(json.dumps(payload, indent=2, sort_keys=True, default=str))
+
+
+def _redact(value):
+    """Return a recursively redacted copy suitable for operator output."""
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            lowered = str(key).lower()
+            if any(marker in lowered for marker in (
+                    "secret", "token", "password", "access_key", "accesskey",
+                    "api_key", "apikey", "credential", "identity")):
+                redacted[key] = "<configured>" if item else "<not set>"
+            elif lowered == "endpoint" or lowered.endswith("url"):
+                redacted[key] = _redact_url(item)
+            else:
+                redacted[key] = _redact(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact(item) for item in value]
+    return value
+
+
+def _redact_url(value):
+    """Avoid printing credentials or secret-bearing query strings in URLs."""
+    if not isinstance(value, str):
+        return _redact(value)
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return "<invalid URL>"
+    if (parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment):
+        return "<redacted URL>"
+    return value
+
+
+def _validate_controller_url(url: str | None) -> str | None:
+    """Validate a controller base URL without allowing embedded secrets."""
+    if url is None or url == "":
+        return url
+    if not isinstance(url, str) or url.strip() != url:
+        raise ValueError("Controller URL must be a canonical HTTP(S) URL")
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(
+            "Controller URL must be a canonical HTTP(S) URL") from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or port is not None and not 1 <= port <= 65535
+        or any(char in url for char in ("\r", "\n", "\t"))
+        or any(part in {".", ".."} for part in parsed.path.split("/"))
+    ):
+        raise ValueError(
+            "Controller URL must be HTTP(S) without credentials, query "
+            "parameters, fragments or dot segments"
+        )
+    return url
+
+
+def _controller_connection(ctx, override_url: str | None = None):
+    """Resolve a controller URL and a token scoped to that exact endpoint."""
+    if (ctx.obj.get("local_profile_error")
+            and not override_url
+            and not ctx.obj.get("controller_url_explicit")
+            and not ctx.obj.get("alternate_store_requested")):
+        raise click.ClickException(ctx.obj["local_profile_error"])
+    configured_url = ctx.obj.get("controller_url") or ""
+    effective_url = override_url or configured_url
+    try:
+        _validate_controller_url(effective_url or None)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    token = ctx.obj.get("controller_token")
+    if (override_url and effective_url.rstrip("/") != configured_url.rstrip("/")
+            and not ctx.obj.get("controller_token_explicit")):
+        token = None
+    return effective_url, token
+
+
+def _get_s3(ctx):
+    """Create the data-plane client only for commands that actually need it."""
+    if (ctx.obj.get("local_profile_error")
+            and not ctx.obj.get("alternate_store_requested")):
+        raise click.ClickException(ctx.obj["local_profile_error"])
+    if ctx.obj.get("s3") is None:
+        ctx.obj["s3"] = create_client(
+            ctx.obj.get("endpoint"),
+            ctx.obj.get("access_key"),
+            ctx.obj.get("secret_key"),
+            ctx.obj.get("region", ""),
+        )
+    return ctx.obj["s3"]
+
+
+def _store_project_candidate(ctx, path: str | None) -> str:
+    candidate = path
+    if not candidate:
+        cfg = ctx.obj.get("resolved_config") or {}
+        if cfg.get("kind") == "local-store":
+            candidate = cfg.get("store_path")
+    return str(Path(candidate or ".").expanduser().resolve())
+
+
+def _store_project_path(ctx, path: str | None) -> str:
+    candidate = _store_project_candidate(ctx, path)
+    try:
+        return load_store_config(candidate).path
+    except Exception as exc:
+        raise click.ClickException(
+            f"{candidate} is not a dsimaging-store project: {exc}"
+        ) from exc
+
+
+def _profile_name(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", value):
+        raise click.ClickException(
+            "profile name must use 1-64 letters, digits, '.', '_' or '-'"
+        )
+    return value
+
+
+def _coalesce_argument_option(argument: str | None, option: str | None,
+                              label: str) -> str:
+    if argument and option and argument != option:
+        raise click.ClickException(
+            f"Conflicting {label} values were provided positionally and by option"
+        )
+    value = argument or option
+    if not value:
+        raise click.ClickException(
+            f"Missing {label}; provide it positionally or with --{label.replace('_', '-')}"
+        )
+    return value
+
+
+def _publication_metadata(source: str, metadata: str | None) -> str | None:
+    if metadata:
+        return metadata
+    root = Path(source).expanduser()
+    candidates = [
+        str(path) for path in (root / "metadata.csv", root / "metadata.parquet")
+        if path.is_file()
+    ]
+    if len(candidates) > 1:
+        raise click.ClickException(
+            "Both metadata.csv and metadata.parquet exist; select one with --metadata"
+        )
+    return candidates[0] if candidates else None
 
 
 def _warn_dataset_alias(command: str) -> None:
@@ -270,6 +530,7 @@ class _DeprecatedDatasetAlias(click.Command):
             + f"'dsimaging-admin dataset {alias_name}' instead.",
             short_help=f"Deprecated alias for dataset {alias_name}.",
             context_settings=target.context_settings,
+            hidden=True,
         )
         self._alias_name = alias_name
 
@@ -301,7 +562,60 @@ class _DeprecatedDatasetAlias(click.Command):
 def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
          controller_url, controller_token, skip_controller, backend):
     """Admin CLI for managing dsimaging-store deployments and datasets."""
-    profile, cfg = _load_profile(profile)
+    ui_environment = {}
+    for parameter, envvar, value in (
+        ("profile", "DSIMAGING_PROFILE", profile),
+        ("endpoint", "DSIMAGING_ENDPOINT", endpoint),
+        ("bucket", "DSIMAGING_BUCKET", bucket),
+        ("region", "DSIMAGING_REGION", region),
+        ("backend", "DSIMAGING_BACKEND", backend),
+        ("controller_url", "DSIMAGING_CONTROLLER_URL", controller_url),
+    ):
+        source = ctx.get_parameter_source(parameter)
+        if source is not None and source.name == "COMMANDLINE" and value is not None:
+            ui_environment[envvar] = str(value)
+    controller_token_explicit = bool(
+        controller_token not in (None, "")
+        or os.environ.get("DSIMAGING_CONTROLLER_TOKEN")
+    )
+    controller_url_explicit = bool(
+        controller_url not in (None, "")
+        or os.environ.get("DSIMAGING_CONTROLLER_URL")
+    )
+    if ctx.invoked_subcommand in {"profile", "init"}:
+        profile = profile or os.environ.get("DSIMAGING_PROFILE") or "default"
+        stored_cfg = {}
+    else:
+        profile, stored_cfg = _load_profile(profile)
+    requested_backend = (
+        backend or os.environ.get("DSIMAGING_BACKEND")
+        or stored_cfg.get("backend") or "auto")
+    alternate_store_requested = bool(
+        endpoint not in (None, "")
+        or os.environ.get("DSIMAGING_ENDPOINT")
+        or stored_cfg.get("endpoint")
+        or requested_backend in {"aws", "s3-compatible"}
+    )
+    local_profile_error = None
+    if ctx.invoked_subcommand == "store":
+        cfg = dict(stored_cfg)
+    else:
+        try:
+            cfg = _hydrate_local_store_profile(stored_cfg)
+        except click.ClickException as exc:
+            if (stored_cfg.get("kind") == "local-store"
+                    and (alternate_store_requested
+                         or ctx.invoked_subcommand in {
+                             "dataset", "publish", "list", "status", "verify",
+                             "delete", "download", "copy", "rescan", "reconcile",
+                         })):
+                cfg = {
+                    key: value for key, value in stored_cfg.items()
+                    if not str(key).startswith("_local_")
+                }
+                local_profile_error = str(exc)
+            else:
+                raise
     backend = _resolve_backend(backend, cfg)
     # A stored profile endpoint applies only to store backends (auto/minio/
     # s3-compatible); when AWS is requested, only an explicit CLI flag or
@@ -309,7 +623,22 @@ def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
     endpoint_cfg = {} if backend == "aws" else cfg
     raw_endpoint = _resolve_optional(endpoint, "DSIMAGING_ENDPOINT", endpoint_cfg,
                                      "endpoint")
-    endpoint = raw_endpoint or ("" if backend == "aws" else "http://127.0.0.1:9000")
+    connection_free_entrypoint = ctx.invoked_subcommand in {
+        "profile", "init", "store", "ui",
+    }
+    if (backend == "s3-compatible" and not raw_endpoint
+            and not connection_free_entrypoint):
+        raise click.ClickException(
+            "s3-compatible mode requires an explicit endpoint URL"
+        )
+    endpoint = raw_endpoint or (
+        "" if backend in {"aws", "s3-compatible"}
+        else "http://127.0.0.1:9000"
+    )
+    try:
+        validate_s3_endpoint(endpoint or None)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     resolved_backend, backend_rationale = detect_backend(endpoint or None, backend)
     if (resolved_backend == "aws" and raw_endpoint and
             not is_native_aws_s3_endpoint(raw_endpoint)):
@@ -317,35 +646,66 @@ def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
             "AWS mode accepts only a native HTTPS S3 endpoint; "
             "omit --endpoint to use the AWS SDK default"
         )
-    if resolved_backend == "aws":
-        access_key = _resolve_optional(access_key, "DSIMAGING_ACCESS_KEY", cfg, "access_key")
-        secret_key = _resolve_optional(secret_key, "DSIMAGING_SECRET_KEY", cfg, "secret_key")
-    else:
-        access_key = _resolve_optional(
-            access_key, "DSIMAGING_ACCESS_KEY", cfg, "access_key")
-        secret_key = _resolve_optional(
-            secret_key, "DSIMAGING_SECRET_KEY", cfg, "secret_key")
+    local_endpoint = cfg.get("_local_endpoint")
+    endpoint_changed = bool(
+        local_endpoint
+        and endpoint.rstrip("/") != str(local_endpoint).rstrip("/")
+    )
+    # A local profile's credentials are scoped to its generated endpoint. If
+    # the endpoint/backend is overridden, only explicit profile/env/CLI
+    # credentials may follow that override.
+    local_profile = stored_cfg.get("kind") == "local-store"
+    credential_cfg = (
+        {} if local_profile and (
+            resolved_backend == "aws" or endpoint_changed or local_profile_error)
+        else cfg
+    )
+    access_key = _resolve_optional(
+        access_key, "DSIMAGING_ACCESS_KEY", credential_cfg, "access_key")
+    secret_key = _resolve_optional(
+        secret_key, "DSIMAGING_SECRET_KEY", credential_cfg, "secret_key")
     bucket = _resolve(bucket, "DSIMAGING_BUCKET", cfg, "bucket", "imaging-data")
     region = _resolve(region, "DSIMAGING_REGION", cfg, "region", "")
     controller_url = _resolve(controller_url, "DSIMAGING_CONTROLLER_URL", cfg,
                               "controller_url", "")
+    try:
+        _validate_controller_url(controller_url or None)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    local_controller_url = cfg.get("_local_controller_url")
+    controller_changed = bool(
+        local_controller_url
+        and controller_url.rstrip("/") != str(local_controller_url).rstrip("/")
+    )
+    controller_credential_cfg = (
+        {} if local_profile and (controller_changed or local_profile_error)
+        else cfg
+    )
     controller_token = _resolve_optional(
-        controller_token, "DSIMAGING_CONTROLLER_TOKEN", cfg,
+        controller_token, "DSIMAGING_CONTROLLER_TOKEN", controller_credential_cfg,
         "controller_token")
 
     ctx.ensure_object(dict)
-    ctx.obj["s3"] = create_client(endpoint, access_key, secret_key, region)
+    ctx.obj["s3"] = None
     ctx.obj["bucket"] = bucket
     ctx.obj["endpoint"] = endpoint
     ctx.obj["access_key"] = access_key
     ctx.obj["secret_key"] = secret_key
     ctx.obj["region"] = region
     ctx.obj["backend"] = resolved_backend
+    ctx.obj["backend_selection"] = backend
     ctx.obj["backend_rationale"] = backend_rationale
     ctx.obj["profile"] = profile
+    ctx.obj["profile_config"] = stored_cfg
+    ctx.obj["resolved_config"] = cfg
     ctx.obj["controller_url"] = controller_url
     ctx.obj["controller_token"] = controller_token
+    ctx.obj["controller_token_explicit"] = controller_token_explicit
+    ctx.obj["controller_url_explicit"] = controller_url_explicit
+    ctx.obj["alternate_store_requested"] = alternate_store_requested
+    ctx.obj["local_profile_error"] = local_profile_error
     ctx.obj["skip_controller"] = skip_controller
+    ctx.obj["ui_environment"] = ui_environment
 
 
 @main.command("init")
@@ -362,6 +722,7 @@ def main(ctx, profile, endpoint, access_key, secret_key, bucket, region,
 def init_config(profile, endpoint, bucket, access_key, secret_key, region,
                 controller_url, set_default):
     """Create or update a ~/.dsimaging.yaml profile."""
+    profile = _profile_name(profile)
     _write_config_profile(profile, {
         "endpoint": endpoint,
         "bucket": bucket,
@@ -370,7 +731,7 @@ def init_config(profile, endpoint, bucket, access_key, secret_key, region,
         "region": region,
         "controller_url": controller_url,
     }, set_default=set_default)
-    click.echo(f"Config profile '{profile}' saved to {CONFIG_PATH}")
+    click.echo(f"Config profile '{profile}' saved to {_config_path()}")
 
 
 @main.group("store")
@@ -381,6 +742,122 @@ def store_group():
 @main.group("dataset")
 def dataset_group():
     """Manage datasets inside an imaging store."""
+
+
+@main.group("profile")
+def profile_group():
+    """Manage named, non-secret store connection profiles."""
+
+
+@profile_group.command("add")
+@click.argument("name")
+@click.option("--store-path", default=None, type=click.Path(file_okay=False),
+              help="Point at a generated local store project")
+@click.option("--backend", type=click.Choice(
+    ["auto", "minio", "aws", "s3-compatible"]), default="auto")
+@click.option("--endpoint", default=None, help="S3-compatible endpoint")
+@click.option("--bucket", default="imaging-data", show_default=True)
+@click.option("--region", default="", help="AWS region")
+@click.option("--controller-url", default=None)
+@click.option("--set-default/--no-set-default", default=True)
+@click.option("--replace", is_flag=True, help="Replace an existing profile")
+def profile_add(name, store_path, backend, endpoint, bucket, region,
+                controller_url, set_default, replace):
+    """Add a profile without writing credentials to the YAML file."""
+    name = _profile_name(name)
+    if store_path:
+        if any((backend != "auto", endpoint, region, controller_url,
+                bucket != "imaging-data")):
+            raise click.ClickException(
+                "--store-path cannot be combined with remote-store options"
+            )
+        try:
+            local = load_store_config(store_path)
+        except Exception as exc:
+            raise click.ClickException(str(exc)) from exc
+        values = {"kind": "local-store", "store_path": local.path}
+    else:
+        if backend == "s3-compatible" and not endpoint:
+            raise click.ClickException(
+                "an s3-compatible profile requires --endpoint"
+            )
+        if backend == "aws" and endpoint and not is_native_aws_s3_endpoint(endpoint):
+            raise click.ClickException(
+                "AWS profiles accept only a native HTTPS S3 endpoint"
+            )
+        values = {"backend": backend, "bucket": bucket}
+        if endpoint:
+            values["endpoint"] = endpoint
+        if region:
+            values["region"] = region
+        if controller_url:
+            values["controller_url"] = controller_url
+    _write_config_profile(
+        name, values, set_default=set_default, replace=replace)
+    click.echo(f"Profile '{name}' saved to {_config_path()} (no credentials stored)")
+
+
+@profile_group.command("list")
+@click.option("--output", type=click.Choice(["text", "json"]), default="text")
+def profile_list(output):
+    """List configured profiles."""
+    data = _load_all_config()
+    profiles = data.get("profiles")
+    if profiles is not None and not isinstance(profiles, dict):
+        raise click.ClickException("Configuration 'profiles' must be a mapping")
+    profiles = profiles or {}
+    default = data.get("default_profile")
+    rows = []
+    for name, values in sorted(profiles.items()):
+        if values is not None and not isinstance(values, dict):
+            raise click.ClickException(
+                f"Configuration profile '{name}' must contain a mapping"
+            )
+        rows.append({
+            "name": str(name), "default": name == default,
+            "kind": (values or {}).get("kind", "remote-store"),
+        })
+    if output == "json":
+        _echo_json({"profiles": rows})
+        return
+    if not rows:
+        click.echo("No named profiles configured.")
+        return
+    for row in rows:
+        suffix = " (default)" if row["default"] else ""
+        click.echo(f"{row['name']} [{row['kind']}]{suffix}")
+
+
+@profile_group.command("show")
+@click.argument("name")
+@click.option("--output", type=click.Choice(["text", "json"]), default="text")
+def profile_show(name, output):
+    """Show one profile with all secret fields redacted."""
+    selected, values = _load_profile(name)
+    payload = {"name": selected, "config": _redact(values)}
+    if output == "json":
+        _echo_json(payload)
+    else:
+        import yaml
+        click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
+
+
+@profile_group.command("use")
+@click.argument("name")
+def profile_use(name):
+    """Select the default profile."""
+    with _config_lock():
+        data = _load_all_config()
+        profiles = data.get("profiles")
+        if not isinstance(profiles, dict) or name not in profiles:
+            raise click.ClickException(
+                f"Configuration profile '{name}' does not exist")
+        if not isinstance(profiles[name] or {}, dict):
+            raise click.ClickException(
+                f"Configuration profile '{name}' must contain a mapping")
+        data["default_profile"] = name
+        _write_config(data)
+    click.echo(f"Default profile set to '{name}'")
 
 
 @main.group("ui", invoke_without_command=True)
@@ -404,7 +881,8 @@ def ui_group(ctx, host, port, open_browser):
               help="Port for the local dashboard server")
 @click.option("--open-browser", is_flag=True,
               help="Ask Streamlit to open a browser window")
-def ui_launch(host, port, open_browser):
+@click.pass_context
+def ui_launch(ctx, host, port, open_browser):
     """Open the Streamlit operator dashboard."""
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise click.ClickException(
@@ -415,7 +893,18 @@ def ui_launch(host, port, open_browser):
         from .ui import launch_ui
     except ImportError as e:
         raise click.ClickException(str(e)) from e
-    launch_ui(host=host, port=port, open_browser=open_browser)
+    root = ctx.find_root().obj or {}
+    environment = {"DSIMAGING_CONFIG": _config_path()}
+    environment.update(root.get("ui_environment") or {})
+    # Credentials are intentionally not copied from command-line arguments to
+    # a child process. The dashboard resolves them from its local-store pointer
+    # or from the child's normal environment/provider chain.
+    launch_ui(
+        host=host,
+        port=port,
+        open_browser=open_browser,
+        environment=environment,
+    )
 
 
 @store_group.command("init")
@@ -462,6 +951,11 @@ def store_init(ctx, path, force, controller_image, store_source, backend, kms_ke
             "configure a profile and run 'dsimaging-admin doctor'"
         )
     if resolved_backend == "aws":
+        if ctx.obj.get("profile_config", {}).get("kind") == "local-store":
+            raise click.ClickException(
+                "AWS provisioning requires a separate AWS profile; "
+                "do not repurpose a local-store profile"
+            )
         aws_endpoint = ctx.obj.get("endpoint") or None
         if aws_endpoint and not is_native_aws_s3_endpoint(aws_endpoint):
             raise click.ClickException(
@@ -495,7 +989,7 @@ def store_init(ctx, path, force, controller_image, store_source, backend, kms_ke
                                    bucket=bucket,
                                    region=report["region"],
                                    endpoint=aws_endpoint)
-            click.echo(f"  SQS queue URL saved to {CONFIG_PATH}")
+            click.echo(f"  SQS queue URL saved to {_config_path()}")
         return
 
     # Connection profiles describe existing stores. Reusing their credentials
@@ -527,52 +1021,194 @@ def store_init(ctx, path, force, controller_image, store_source, backend, kms_ke
     click.echo(f"  Bucket:         {cfg.bucket}")
 
 
-@store_group.command("up")
-@click.argument("path", default=".", type=click.Path(file_okay=False))
-@click.option("--no-build", is_flag=True, help="Do not pass --build to docker compose")
-def store_up(path, no_build):
-    """Start a store."""
-    root = Path(path).expanduser().resolve()
-    if not ((root / "docker-compose.yml").exists() and (root / ".env").exists()):
+@store_group.command("provision")
+@click.option("--kms-key", default=None,
+              help="AWS KMS key ARN; omit for SSE-S3 AES256")
+@click.pass_context
+def store_provision(ctx, kms_key):
+    """Provision the explicitly selected AWS S3/SQS store."""
+    if ctx.obj.get("backend_selection") != "aws":
         raise click.ClickException(
-            f"{path} is not a dsimaging-store project "
-            "(missing docker-compose.yml/.env); "
-            "run 'dsimaging-admin store init <dir>' first "
-            "or pass the store directory"
+            "store provision requires an explicit AWS profile or --backend aws"
         )
-    _echo_command_output(compose_up(path, build=not no_build))
+    if ctx.obj.get("profile_config", {}).get("kind") == "local-store":
+        raise click.ClickException(
+            "AWS provisioning requires a separate AWS profile; "
+            "do not repurpose a local-store profile"
+        )
+    endpoint = ctx.obj.get("endpoint") or None
+    if endpoint and not is_native_aws_s3_endpoint(endpoint):
+        raise click.ClickException(
+            "AWS provisioning accepts only a native HTTPS S3 endpoint"
+        )
+    try:
+        report = provision_aws_store(
+            endpoint,
+            ctx.obj["bucket"],
+            region=ctx.obj.get("region") or "us-east-1",
+            access_key=ctx.obj.get("access_key"),
+            secret_key=ctx.obj.get("secret_key"),
+            kms_key=kms_key,
+        )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    if report.get("sqs_queue_url"):
+        _persist_aws_queue_url(
+            ctx.obj.get("profile") or "default",
+            report["sqs_queue_url"],
+            bucket=ctx.obj["bucket"],
+            region=report["region"],
+            endpoint=endpoint,
+        )
+    click.echo("AWS store ready")
+    click.echo(f"  Bucket: {ctx.obj['bucket']}")
+    click.echo(f"  Region: {report['region']}")
+    click.echo("  Versioning, encryption and event queue: configured")
+    click.echo("Next: dsimaging-admin dataset publish DATASET_ID SOURCE")
+
+
+def _serialised_store_setup(function):
+    @wraps(function)
+    def locked(path, *args, **kwargs):
+        try:
+            check_compose_prerequisites()
+        except Exception as exc:
+            raise click.ClickException(
+                f"Docker Compose prerequisite check failed: {exc}") from exc
+        with store_project_lock(path):
+            return function(path, *args, **kwargs)
+    return locked
+
+
+@store_group.command("setup")
+@click.argument("path", required=True, type=click.Path(file_okay=False))
+@click.option("--profile-name", default=None,
+              help="Profile name [default: store directory name]")
+@click.option("--no-build", is_flag=True,
+              help="Do not pass --build to docker compose")
+@click.option("--timeout", default=120, show_default=True,
+              type=click.IntRange(min=1), help="Seconds to wait for readiness")
+@click.option("--replace-profile", is_flag=True,
+              help="Replace a different profile with the selected name")
+@_serialised_store_setup
+def store_setup(path, profile_name, no_build, timeout, replace_profile):
+    """Create, start and activate a local store in one command."""
+    root = Path(path).expanduser().resolve()
+    profile_name = _profile_name(profile_name or root.name)
+    desired_profile = {"kind": "local-store", "store_path": str(root)}
+    profiles = _load_all_config().get("profiles") or {}
+    if (isinstance(profiles, dict) and profile_name in profiles
+            and profiles[profile_name] != desired_profile
+            and not replace_profile):
+        raise click.ClickException(
+            f"Configuration profile '{profile_name}' already points elsewhere; "
+            "choose --profile-name or use --replace-profile"
+        )
+    created = False
+    try:
+        if root.exists() and any(root.iterdir()):
+            cfg = load_store_config(str(root))
+        else:
+            cfg = init_store(str(root), force=False)
+            created = True
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"[1/5] Project ........... {'created' if created else 'valid'}")
+    try:
+        _echo_command_output(compose_up(cfg.path, build=not no_build))
+    except Exception as exc:
+        raise click.ClickException(f"Could not start the store: {exc}") from exc
+    click.echo("[2/5] Compose ........... started")
+
+    deadline = time.monotonic() + timeout
+    last_result = None
+    while True:
+        try:
+            last_result = store_doctor(cfg.path)
+        except Exception as exc:
+            last_result = {"ok": False, "error": str(exc)}
+        if last_result.get("ok"):
+            break
+        if time.monotonic() >= deadline:
+            details = last_result.get("error") or ", ".join(
+                f"{name}: {item.get('error', 'not ready')}"
+                for name, item in last_result.items()
+                if isinstance(item, dict) and item.get("ok") is False
+            )
+            raise click.ClickException(
+                f"Store did not become ready within {timeout}s: {details}"
+            )
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+    click.echo("[3/5] Bucket/versioning . OK")
+    click.echo("[4/5] Controller ........ OK")
+    _write_config_profile(
+        profile_name,
+        {"kind": "local-store", "store_path": cfg.path},
+        set_default=True,
+        replace=replace_profile,
+        allow_same=True,
+    )
+    click.echo(f"[5/5] Profile ........... {profile_name} (default)")
+    click.echo("")
+    click.echo(click.style("Store ready. Credentials: configured (not shown)",
+                           fg="green", bold=True))
+    click.echo("Next: dsimaging-admin dataset publish DATASET_ID SOURCE")
+
+
+@store_group.command("up")
+@click.argument("path", required=False, type=click.Path(file_okay=False))
+@click.option("--no-build", is_flag=True, help="Do not pass --build to docker compose")
+@click.pass_context
+def store_up(ctx, path, no_build):
+    """Start a store."""
+    project = _store_project_path(ctx, path)
+    _echo_command_output(compose_up(project, build=not no_build))
 
 
 @store_group.command("down")
-@click.argument("path", default=".", type=click.Path(file_okay=False))
+@click.argument("path", required=False, type=click.Path(file_okay=False))
 @click.option("--volumes", is_flag=True, help="Remove store volumes")
-def store_down(path, volumes):
+@click.option("--yes", is_flag=True,
+              help="Confirm irreversible volume removal")
+@click.pass_context
+def store_down(ctx, path, volumes, yes):
     """Stop a store."""
-    _echo_command_output(compose_down(path, volumes=volumes))
+    if volumes and not yes:
+        raise click.ClickException(
+            "Refusing to remove store volumes without both --volumes and --yes"
+        )
+    project = _store_project_path(ctx, path)
+    _echo_command_output(compose_down(project, volumes=volumes))
 
 
 @store_group.command("ps")
-@click.argument("path", default=".", type=click.Path(file_okay=False))
-def store_ps(path):
+@click.argument("path", required=False, type=click.Path(file_okay=False))
+@click.pass_context
+def store_ps(ctx, path):
     """Show store containers."""
-    _echo_command_output(compose_ps(path))
+    _echo_command_output(compose_ps(_store_project_path(ctx, path)))
 
 
 @store_group.command("logs")
-@click.argument("path", default=".", type=click.Path(file_okay=False))
+@click.argument("path", required=False, type=click.Path(file_okay=False))
 @click.option("--service", default=None, help="Service name")
 @click.option("--tail", default=100, show_default=True)
-def store_logs(path, service, tail):
+@click.pass_context
+def store_logs(ctx, path, service, tail):
     """Show store logs."""
-    _echo_command_output(compose_logs(path, service=service, tail=tail))
+    project = _store_project_path(ctx, path)
+    _echo_command_output(compose_logs(project, service=service, tail=tail))
 
 
 @store_group.command("config")
-@click.argument("path", default=".", type=click.Path(file_okay=False))
+@click.argument("path", required=False, type=click.Path(file_okay=False))
 @click.option("--output", type=click.Choice(["text", "json"]), default="text")
-def store_config(path, output):
+@click.pass_context
+def store_config(ctx, path, output):
     """Print connection details for a store directory."""
-    cfg = load_store_config(path)
+    cfg = load_store_config(_store_project_path(ctx, path))
     if output == "json":
         _echo_json(cfg.to_dict())
         return
@@ -587,11 +1223,12 @@ def store_config(path, output):
 
 
 @store_group.command("doctor")
-@click.argument("path", default=".", type=click.Path(file_okay=False))
+@click.argument("path", required=False, type=click.Path(file_okay=False))
 @click.option("--output", type=click.Choice(["text", "json"]), default="text")
-def store_doctor_cmd(path, output):
+@click.pass_context
+def store_doctor_cmd(ctx, path, output):
     """Check Docker, controller and S3 health for a store directory."""
-    result = store_doctor(path)
+    result = store_doctor(_store_project_candidate(ctx, path))
     if output == "json":
         _echo_json(result)
         if not result["ok"]:
@@ -610,12 +1247,15 @@ def store_doctor_cmd(path, output):
 
 
 @dataset_group.command("publish")
-@click.option("--dataset-id", required=True, help="Dataset identifier")
-@click.option("--source", required=True, type=click.Path(exists=True),
+@click.argument("dataset_id_arg", required=False, metavar="DATASET_ID")
+@click.argument("source_arg", required=False, metavar="SOURCE",
+                type=click.Path(exists=True))
+@click.option("--dataset-id", "dataset_id_option", help="Dataset identifier")
+@click.option("--source", "source_option", type=click.Path(exists=True),
               help="Local directory containing images")
 @click.option("--metadata", default=None, type=click.Path(exists=True, dir_okay=False),
               help="CSV/Parquet metadata required by the patient privacy contract")
-@click.option("--privacy-unit-column", required=True,
+@click.option("--privacy-unit-column", default=None,
               help="Metadata column containing the patient privacy unit")
 @click.option("--label-column", default=None,
               help="Optional complete metadata label/outcome column")
@@ -628,11 +1268,19 @@ def store_doctor_cmd(path, output):
               help="Publish through a staging prefix and publish lock")
 @click.option("--dry-run", is_flag=True, help="Scan and plan without S3 writes")
 @click.option("--skip-dicom-checks", is_flag=True, help="Skip pre-publish DICOM sanity checks")
+@click.option("--verify", "verify_mode",
+              type=click.Choice(["quick", "full", "none"]),
+              default="quick", show_default=True,
+              help="Verification performed before committing the publication")
 @click.pass_context
-def publish(ctx, dataset_id, source, metadata, privacy_unit_column, label_column,
-            label_levels, modality, replace, atomic, dry_run,
-            skip_dicom_checks):
+def publish(ctx, dataset_id_arg, source_arg, dataset_id_option, source_option,
+            metadata, privacy_unit_column, label_column, label_levels, modality,
+            replace, atomic, dry_run, skip_dicom_checks, verify_mode):
     """Publish a local dataset to S3/MinIO."""
+    dataset_id = _coalesce_argument_option(
+        dataset_id_arg, dataset_id_option, "dataset_id")
+    source = _coalesce_argument_option(
+        source_arg, source_option, "source")
     if not atomic:
         raise click.ClickException(
             "non-atomic dataset publishing is disabled"
@@ -642,41 +1290,39 @@ def publish(ctx, dataset_id, source, metadata, privacy_unit_column, label_column
     except ValueError as e:
         raise click.ClickException(str(e)) from e
 
-    s3 = ctx.obj["s3"]
-    bucket = ctx.obj["bucket"]
-    prefix = f"datasets/{dataset_id}"
-    existing_objects = list_objects(s3, bucket, f"{prefix}/")
-    if existing_objects and not replace:
-        raise click.ClickException(
-            "dataset already exists; use --replace for an explicit atomic replacement"
-        )
-
-    click.echo(f"Publishing dataset: {dataset_id}")
-    click.echo(f"  Source: {os.path.abspath(source)}")
-
-    click.echo("  Scanning images...")
+    click.echo(f"[1/5] Scanning images for {dataset_id}...")
     samples = scan_images(source)
     if not samples:
         raise click.ClickException("No image files found.")
-    click.echo(f"  Found {len(samples)} samples")
+    click.echo(f"      Found {len(samples)} samples")
 
     if not skip_dicom_checks:
         warnings = validate_dicom_series(source)
         for warning in warnings:
-            click.echo(click.style(f"  WARN: {warning}", fg="yellow"))
+            click.echo(click.style(f"      WARN: {warning}", fg="yellow"))
 
-    click.echo("  Scanning masks...")
+    click.echo("[2/5] Scanning masks and metadata...")
     masks = scan_masks(source, sample_ids=[sample["sample_id"] for sample in samples])
-    click.echo(f"  Found {len(masks)} masks" if masks else "  No masks found")
+    click.echo(f"      Found {len(masks)} masks" if masks else "      No masks found")
 
+    metadata = _publication_metadata(source, metadata)
     extra_metadata = None
     if metadata:
-        click.echo("  Reading metadata...")
         try:
             extra_metadata = read_metadata_table(metadata)
         except ValueError as e:
             raise click.ClickException(str(e)) from e
-        click.echo(f"  Metadata columns: {', '.join(extra_metadata.column_names)}")
+        click.echo(f"      Metadata: {os.path.abspath(metadata)}")
+        click.echo(f"      Columns: {', '.join(extra_metadata.column_names)}")
+    if privacy_unit_column is None:
+        if extra_metadata is not None and "patient_id" in extra_metadata.column_names:
+            privacy_unit_column = "patient_id"
+            click.echo("      Privacy unit: patient_id (exact match)")
+        else:
+            raise click.ClickException(
+                "Could not infer the patient privacy unit; provide "
+                "--privacy-unit-column and metadata containing that column"
+            )
 
     try:
         build_samples_metadata(
@@ -687,61 +1333,48 @@ def publish(ctx, dataset_id, source, metadata, privacy_unit_column, label_column
     except ValueError as e:
         raise click.ClickException(str(e)) from e
 
-    # New publications have no prior index, while replacements must stage the
-    # complete source set so stale historical objects can be removed safely.
+    s3 = _get_s3(ctx)
+    bucket = ctx.obj["bucket"]
+    prefix = f"datasets/{dataset_id}"
+    existing_objects = list_objects(s3, bucket, f"{prefix}/")
+    if existing_objects and not replace:
+        raise click.ClickException(
+            "dataset already exists; use --replace for an explicit atomic replacement"
+        )
+
+    click.echo("[3/5] Preflight complete")
+    click.echo(f"      Source: {os.path.abspath(source)}")
+    click.echo(f"      Destination: s3://{bucket}/{prefix}/")
+    click.echo(f"      Images: {len(samples)}; masks: {len(masks)}")
+    click.echo(f"      Verification: {verify_mode}")
+
+    # Atomic replacements stage the complete source set so stale historical
+    # objects can be removed safely.
     sample_uploads = samples
     mask_uploads = masks
-    click.echo(f"  Images to upload: {len(sample_uploads)}")
-    click.echo(f"  Masks to upload:  {len(mask_uploads)}")
     if dry_run:
         click.echo(click.style("Dry run complete; no S3 writes performed.", fg="green"))
         return
 
-    transaction = None
-    try:
-        if atomic:
-            transaction = _atomic_upload_sources(
-                s3, bucket, prefix, sample_uploads, mask_uploads,
-                replace=replace, require_empty=not replace,
-            )
-        else:
-            _upload_sources(s3, bucket, prefix, sample_uploads, mask_uploads)
+    click.echo("[4/5] Uploading and building publication artifacts...")
+    _publish_dataset_atomic(
+        s3, bucket, dataset_id, sample_uploads, mask_uploads,
+        extra_metadata=extra_metadata,
+        privacy_unit_col=privacy_unit_column,
+        label_col=label_column,
+        label_levels=label_levels,
+        modality=modality,
+        replace=replace,
+        verify_mode=verify_mode,
+    )
 
-        transaction["mutated"] = True
-        published_objects = list_objects(
-            s3, bucket, f"{prefix}/source/images/", include_version_ids=True)
-        published_mask_objects = list_objects(
-            s3, bucket, f"{prefix}/source/masks/", include_version_ids=True)
-        published_samples = scan_s3_images(
-            s3, bucket, prefix, published_objects)
-        published_masks = scan_s3_masks(
-            s3, bucket, prefix, published_mask_objects,
-            sample_ids=[sample["sample_id"] for sample in published_samples],
-        )
-        _write_dataset_artifacts(
-            s3, bucket, prefix, dataset_id, modality, published_samples,
-            masks=published_masks, extra_metadata=extra_metadata,
-            expected_images=published_objects,
-            expected_masks=published_mask_objects,
-            privacy_unit_col=privacy_unit_column, label_col=label_column,
-            label_levels=label_levels,
-            publish_lock=transaction["publish_lock"],
-        )
-    except Exception:
-        if transaction is not None:
-            _finish_atomic_publish(s3, bucket, prefix, transaction, commit=False)
-        raise
-    else:
-        if transaction is not None:
-            if not _finish_atomic_publish(
-                    s3, bucket, prefix, transaction, commit=True):
-                raise RuntimeError("dataset publication lock ownership was lost")
-
+    click.echo("[5/5] Publication committed and lock released")
     click.echo("")
     click.echo(click.style(f"Dataset '{dataset_id}' published!", fg="green", bold=True))
     click.echo(f"  Location: s3://{bucket}/{prefix}/")
     click.echo(f"  Samples:  {len(samples)}")
     click.echo(f"  Masks:    {len(masks)}")
+    click.echo(f"Next: dsimaging-admin dataset status {dataset_id}")
 
 
 @dataset_group.command("list")
@@ -751,13 +1384,13 @@ def publish(ctx, dataset_id, source, metadata, privacy_unit_column, label_column
 @click.pass_context
 def list_cmd(ctx, output, controller_url, skip_controller):
     """List datasets."""
-    datasets = list_datasets(ctx.obj["s3"], ctx.obj["bucket"])
-    ctrl_url = controller_url or ctx.obj.get("controller_url")
+    datasets = list_datasets(_get_s3(ctx), ctx.obj["bucket"])
+    ctrl_url, ctrl_token = _controller_connection(ctx, controller_url)
     if ctrl_url and not (skip_controller or ctx.obj.get("skip_controller")):
         try:
             datasets = _merge_controller_datasets(
                 datasets, controller_api.datasets(
-                    ctrl_url, token=ctx.obj.get("controller_token"))
+                    ctrl_url, token=ctrl_token)
             )
         except Exception as e:
             if output == "text":
@@ -816,10 +1449,11 @@ def doctor(ctx, controller_url, skip_controller, output):
 def status(ctx, dataset_id, controller_url, skip_controller, output):
     """Show detailed status for one dataset."""
     _validate_dataset_cli(dataset_id)
+    ctrl_url, ctrl_token = _controller_connection(ctx, controller_url)
     payload = _dataset_status(
-        ctx.obj["s3"], ctx.obj["bucket"], dataset_id,
-        controller_url=controller_url or ctx.obj.get("controller_url"),
-        controller_token=ctx.obj.get("controller_token"),
+        _get_s3(ctx), ctx.obj["bucket"], dataset_id,
+        controller_url=ctrl_url,
+        controller_token=ctrl_token,
         skip_controller=skip_controller or ctx.obj.get("skip_controller"),
     )
     controller = payload.get("controller") or {}
@@ -861,7 +1495,7 @@ def verify_cmd(ctx, dataset_id, sample_fraction, quick, output):
     _validate_dataset_cli(dataset_id)
     try:
         result = verify_dataset(
-            ctx.obj["s3"], ctx.obj["bucket"], dataset_id,
+            _get_s3(ctx), ctx.obj["bucket"], dataset_id,
             sample_fraction=sample_fraction, quick=quick,
         )
     except Exception as e:
@@ -888,26 +1522,63 @@ def verify_cmd(ctx, dataset_id, sample_fraction, quick, output):
 @click.argument("dataset_id")
 @click.option("--yes", is_flag=True, help="Confirm deletion")
 @click.option("--purge-versions", is_flag=True,
-              help="Delete all S3 versions and delete markers under the dataset")
+              help="Deprecated compatibility path for irreversible purge")
+@click.option("--confirm", default=None, metavar="DATASET_ID",
+              help="Type the dataset ID when using --purge-versions")
 @click.pass_context
-def delete_cmd(ctx, dataset_id, yes, purge_versions):
-    """Delete a dataset prefix from S3."""
+def delete_cmd(ctx, dataset_id, yes, purge_versions, confirm):
+    """Delete current dataset objects while preserving version history."""
     _validate_dataset_cli(dataset_id)
     if not yes:
         raise click.ClickException("Refusing to delete without --yes")
-    s3 = ctx.obj["s3"]
+    s3 = _get_s3(ctx)
     bucket = ctx.obj["bucket"]
-    prefix = f"datasets/{dataset_id}/"
-    objects = list_objects(s3, bucket, prefix)
-    current_deleted = delete_keys(s3, bucket, [obj["key"] for obj in objects])
-    version_deleted = 0
     if purge_versions:
-        versions = list_object_versions(s3, bucket, prefix)
-        version_deleted = delete_object_versions(s3, bucket, versions)
+        click.echo(
+            "WARN: --purge-versions is deprecated; use 'dataset purge'",
+            err=True,
+        )
+        if confirm != dataset_id:
+            raise click.ClickException(
+                "Irreversible purge requires --confirm with the exact dataset ID"
+            )
+        try:
+            version_deleted = _purge_dataset(s3, bucket, dataset_id)
+        except Exception as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.echo(click.style(f"Purged dataset '{dataset_id}'", fg="green"))
+        click.echo(f"  Versions/delete markers: {version_deleted}")
+        return
+    try:
+        current_deleted = _delete_dataset_current(s3, bucket, dataset_id)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
     click.echo(click.style(f"Deleted dataset '{dataset_id}'", fg="green"))
     click.echo(f"  Current objects: {current_deleted}")
-    if purge_versions:
-        click.echo(f"  Versions/delete markers: {version_deleted}")
+    click.echo("  Version history: preserved")
+
+
+@dataset_group.command("purge")
+@click.argument("dataset_id")
+@click.option("--yes", is_flag=True, help="Confirm irreversible purging")
+@click.option("--confirm", required=False, metavar="DATASET_ID",
+              help="Type the dataset ID to confirm")
+@click.pass_context
+def purge_cmd(ctx, dataset_id, yes, confirm):
+    """Permanently remove every dataset version and delete marker."""
+    _validate_dataset_cli(dataset_id)
+    if not yes or confirm != dataset_id:
+        raise click.ClickException(
+            "Refusing irreversible purge without --yes and "
+            "--confirm with the exact dataset ID"
+        )
+    try:
+        deleted = _purge_dataset(
+            _get_s3(ctx), ctx.obj["bucket"], dataset_id)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(click.style(f"Purged dataset '{dataset_id}'", fg="green"))
+    click.echo(f"  Versions/delete markers: {deleted}")
 
 
 @dataset_group.command("download")
@@ -918,7 +1589,7 @@ def delete_cmd(ctx, dataset_id, yes, purge_versions):
 def download(ctx, dataset_id, dest, overwrite):
     """Download a dataset prefix for inspection."""
     _validate_dataset_cli(dataset_id)
-    s3 = ctx.obj["s3"]
+    s3 = _get_s3(ctx)
     bucket = ctx.obj["bucket"]
     prefix = f"datasets/{dataset_id}/"
     objects = list_objects(s3, bucket, prefix)
@@ -954,7 +1625,7 @@ def copy_cmd(ctx, src_id, dst_id, yes, replace):
         raise click.ClickException("source and destination datasets must differ")
     if not yes:
         raise click.ClickException("Refusing to copy without --yes")
-    s3 = ctx.obj["s3"]
+    s3 = _get_s3(ctx)
     bucket = ctx.obj["bucket"]
     src_prefix = f"datasets/{src_id}"
     dst_prefix = f"datasets/{dst_id}"
@@ -1019,6 +1690,8 @@ def copy_cmd(ctx, src_id, dst_id, yes, replace):
             existing_manifest=source_manifest,
             publish_lock=transaction["publish_lock"],
         )
+        _verify_owned_publication(
+            s3, bucket, dst_id, transaction["publish_lock"], "quick")
     except Exception:
         if transaction is not None:
             _finish_atomic_publish(
@@ -1044,7 +1717,7 @@ def rescan(ctx, dataset_id):
     """Re-scan and update indexes for a dataset from current S3 contents."""
     _validate_dataset_cli(dataset_id)
     click.echo(f"Rescanning: {dataset_id}")
-    s3 = ctx.obj["s3"]
+    s3 = _get_s3(ctx)
     bucket = ctx.obj["bucket"]
     prefix = f"datasets/{dataset_id}"
     transaction = None
@@ -1078,12 +1751,12 @@ def rescan(ctx, dataset_id):
 def reconcile(ctx, dataset_id, controller_url):
     """Ask a reachable controller to reconcile one dataset."""
     _validate_dataset_cli(dataset_id)
-    ctrl_url = controller_url or ctx.obj.get("controller_url")
+    ctrl_url, ctrl_token = _controller_connection(ctx, controller_url)
     if not ctrl_url:
         raise click.ClickException("No controller URL configured")
     try:
         payload = controller_api.reconcile(
-            ctrl_url, dataset_id, token=ctx.obj.get("controller_token"))
+            ctrl_url, dataset_id, token=ctrl_token)
     except Exception as e:
         raise click.ClickException(str(e)) from e
     _echo_json(payload)
@@ -1124,7 +1797,7 @@ def modify(ctx, dataset_id, metadata, add_images, add_masks, dry_run, yes):
     if not any([metadata, add_images, add_masks]):
         raise click.ClickException("Provide --metadata, --add-images or --add-masks")
 
-    s3 = ctx.obj["s3"]
+    s3 = _get_s3(ctx)
     bucket = ctx.obj["bucket"]
     prefix = f"datasets/{dataset_id}"
     if not head_object(s3, bucket, f"{prefix}/manifest.yaml"):
@@ -1285,6 +1958,9 @@ def _rescan_dataset_artifacts(s3, bucket: str, dataset_id: str,
         existing_manifest=existing_manifest,
         publish_lock=publish_lock,
     )
+    if publish_lock is not None:
+        _verify_owned_publication(
+            s3, bucket, dataset_id, publish_lock, "quick")
     return {
         "objects": len(objects),
         "mask_objects": len(mask_objects),
@@ -1370,6 +2046,116 @@ def _delete_keys_exact(s3, bucket: str, keys: list[str]) -> None:
         raise RuntimeError("S3 object deletion was incomplete")
 
 
+def _purge_temporary_prefix(s3, bucket: str, prefix: str) -> bool:
+    """Remove visible temp objects and best-effort historical duplicates."""
+    current = [obj["key"] for obj in list_objects(s3, bucket, prefix)]
+    _delete_keys_exact(s3, bucket, current)
+    try:
+        versions = list_object_versions(s3, bucket, prefix)
+        if versions:
+            delete_object_versions(s3, bucket, versions)
+        return not list_object_versions(s3, bucket, prefix)
+    except Exception:
+        # Version-history cleanup is storage hygiene, not part of publication
+        # correctness: each temp object duplicates a canonical version and no
+        # temp key remains current. Roles that can publish but cannot manage
+        # historical versions therefore retain their previous capability set.
+        return False
+
+
+def _require_bucket_versioning(s3, bucket: str) -> None:
+    try:
+        status = s3.get_bucket_versioning(Bucket=bucket).get("Status")
+    except Exception as exc:
+        raise RuntimeError("could not verify bucket versioning") from exc
+    if status != "Enabled":
+        raise RuntimeError(
+            "dataset deletion requires bucket versioning to be enabled"
+        )
+
+
+def _delete_dataset_current(s3, bucket: str, dataset_id: str) -> int:
+    prefix = f"datasets/{dataset_id}"
+    _require_bucket_versioning(s3, bucket)
+    try:
+        publish_lock = _acquire_publish_lock(
+            s3, bucket, prefix, status="deleting")
+    except Exception as exc:
+        raise RuntimeError("dataset has an active operation") from exc
+    if not publish_lock.get("version_id"):
+        _release_publish_lock(s3, bucket, publish_lock)
+        raise RuntimeError(
+            "dataset deletion could not establish a versioned lock"
+        )
+    released = False
+    try:
+        current = [
+            obj["key"] for obj in list_objects(s3, bucket, f"{prefix}/")
+            if obj["key"] != publish_lock["key"]
+        ]
+        _delete_keys_exact(s3, bucket, current)
+        remaining = [
+            obj["key"] for obj in list_objects(s3, bucket, f"{prefix}/")
+            if obj["key"] != publish_lock["key"]
+        ]
+        if remaining:
+            raise RuntimeError(
+                "dataset changed during deletion; current objects remain"
+            )
+        released = _release_publish_lock(s3, bucket, publish_lock)
+        if not released:
+            raise RuntimeError("dataset deletion lock ownership was lost")
+        return len(current)
+    finally:
+        if not released:
+            _release_publish_lock(s3, bucket, publish_lock)
+
+
+def _purge_dataset(s3, bucket: str, dataset_id: str) -> int:
+    prefix = f"datasets/{dataset_id}"
+    _require_bucket_versioning(s3, bucket)
+    try:
+        publish_lock = _acquire_publish_lock(
+            s3, bucket, prefix, status="purging")
+    except Exception as exc:
+        raise RuntimeError("dataset has an active operation") from exc
+    if not publish_lock.get("version_id"):
+        _release_publish_lock(s3, bucket, publish_lock)
+        raise RuntimeError(
+            "irreversible purge requires bucket versioning to be enabled"
+        )
+    released = False
+    try:
+        own_version = (
+            publish_lock["key"], publish_lock["version_id"])
+        versions = list_object_versions(s3, bucket, f"{prefix}/")
+        targets = [
+            item for item in versions
+            if (item.get("key"), item.get("version_id")) != own_version
+        ]
+        deleted = delete_object_versions(s3, bucket, targets)
+        remaining = list_object_versions(s3, bucket, f"{prefix}/")
+        unexpected = [
+            item for item in remaining
+            if (item.get("key"), item.get("version_id")) != own_version
+        ]
+        own = [
+            item for item in remaining
+            if (item.get("key"), item.get("version_id")) == own_version
+        ]
+        if unexpected or len(own) != 1:
+            raise RuntimeError(
+                "dataset changed during purge; versioned objects remain"
+            )
+        released = _release_publish_lock(s3, bucket, publish_lock)
+        if not released:
+            raise RuntimeError("dataset purge lock ownership was lost")
+        return deleted
+    finally:
+        if not released:
+            _release_publish_lock(s3, bucket, publish_lock)
+
+
 def _upload_sources(s3, bucket: str, prefix: str,
                     samples: list[dict], masks: list[dict]) -> None:
     click.echo("  Uploading source objects to S3...")
@@ -1377,6 +2163,108 @@ def _upload_sources(s3, bucket: str, prefix: str,
         _upload_sample(s3, bucket, prefix, sample, "images")
     for mask in masks:
         _upload_sample(s3, bucket, prefix, mask, "masks")
+
+
+def _publish_dataset_atomic(
+    s3,
+    bucket: str,
+    dataset_id: str,
+    samples: list[dict],
+    masks: list[dict],
+    *,
+    extra_metadata,
+    privacy_unit_col: str,
+    label_col: str | None,
+    label_levels,
+    modality: str,
+    replace: bool,
+    verify_mode: str = "quick",
+):
+    """Publish prepared inputs and verify them before releasing the lock."""
+    if verify_mode not in {"quick", "full", "none"}:
+        raise ValueError("verify_mode must be quick, full or none")
+    prefix = f"datasets/{dataset_id}"
+    transaction = _atomic_upload_sources(
+        s3, bucket, prefix, samples, masks,
+        replace=replace, require_empty=not replace,
+    )
+    try:
+        transaction["mutated"] = True
+        published_objects = list_objects(
+            s3, bucket, f"{prefix}/source/images/", include_version_ids=True)
+        published_mask_objects = list_objects(
+            s3, bucket, f"{prefix}/source/masks/", include_version_ids=True)
+        published_samples = scan_s3_images(
+            s3, bucket, prefix, published_objects)
+        published_masks = scan_s3_masks(
+            s3, bucket, prefix, published_mask_objects,
+            sample_ids=[sample["sample_id"] for sample in published_samples],
+        )
+        if (_source_content_inventory(published_samples)
+                != _source_content_inventory(samples)
+                or _source_content_inventory(published_masks)
+                != _source_content_inventory(masks)):
+            raise RuntimeError(
+                "local source content changed while it was being uploaded"
+            )
+        _write_dataset_artifacts(
+            s3, bucket, prefix, dataset_id, modality, published_samples,
+            masks=published_masks, extra_metadata=extra_metadata,
+            expected_images=published_objects,
+            expected_masks=published_mask_objects,
+            privacy_unit_col=privacy_unit_col, label_col=label_col,
+            label_levels=label_levels,
+            publish_lock=transaction["publish_lock"],
+        )
+        verification = _verify_owned_publication(
+            s3, bucket, dataset_id, transaction["publish_lock"], verify_mode)
+    except Exception:
+        _finish_atomic_publish(
+            s3, bucket, prefix, transaction, commit=False)
+        raise
+    if not _finish_atomic_publish(
+            s3, bucket, prefix, transaction, commit=True):
+        raise RuntimeError("dataset publication lock ownership was lost")
+    return verification
+
+
+def _source_content_inventory(items: list[dict]) -> list[tuple]:
+    """Stable fields shared by local scans and their uploaded S3 copies."""
+    return sorted(
+        (
+            item.get("sample_id"),
+            item.get("source_kind"),
+            item.get("uri_path"),
+            item.get("content_hash"),
+            int(item.get("size", 0)),
+            tuple(
+                (entry.get("path"), entry.get("role"))
+                for entry in item.get("files", [])
+            ),
+        )
+        for item in items
+    )
+
+
+def _verify_owned_publication(s3, bucket: str, dataset_id: str,
+                              publish_lock: dict, mode: str):
+    if mode == "none":
+        return None
+    verification = verify_dataset(
+        s3, bucket, dataset_id,
+        sample_fraction=1.0,
+        quick=mode == "quick",
+        expected_publish_lock=publish_lock,
+    )
+    if not verification.ok:
+        details = "; ".join(
+            issue.detail for issue in verification.issues[:3]
+        )
+        raise RuntimeError(
+            "publication verification failed before commit"
+            + (f": {details}" if details else "")
+        )
+    return verification
 
 
 def _atomic_upload_sources(s3, bucket: str, prefix: str,
@@ -1457,7 +2345,6 @@ def _finish_atomic_publish(s3, bucket: str, prefix: str,
     backup_prefix = transaction["backup_prefix"]
     publish_lock = transaction["publish_lock"]
     lock_key = publish_lock["key"]
-    staged = list_objects(s3, bucket, f"{staging_prefix}/")
     backups = list_objects(s3, bucket, f"{backup_prefix}/")
     if not _publish_lock_is_owned(s3, bucket, publish_lock):
         # Another owner now controls recovery. Preserve this transaction's
@@ -1475,9 +2362,8 @@ def _finish_atomic_publish(s3, bucket: str, prefix: str,
         for obj in backups:
             suffix = obj["key"][len(backup_prefix):]
             copy_object(s3, bucket, obj["key"], f"{prefix}{suffix}")
-    cleanup = [obj["key"] for obj in staged + backups]
-    if cleanup:
-        _delete_keys_exact(s3, bucket, cleanup)
+    _purge_temporary_prefix(s3, bucket, f"{staging_prefix}/")
+    _purge_temporary_prefix(s3, bucket, f"{backup_prefix}/")
     return _release_publish_lock(s3, bucket, publish_lock)
 
 
@@ -1493,7 +2379,12 @@ def _acquire_publish_lock(s3, bucket: str, prefix: str, *, status: str,
         s3, bucket, key, json.dumps(payload).encode("utf-8"),
         content_type="application/json", if_absent=True,
     )
-    return {"key": key, "owner": owner, "etag": response.get("ETag")}
+    return {
+        "key": key,
+        "owner": owner,
+        "etag": response.get("ETag"),
+        "version_id": response.get("VersionId"),
+    }
 
 
 def _release_publish_lock(s3, bucket: str, publish_lock: dict) -> bool:
@@ -1502,7 +2393,9 @@ def _release_publish_lock(s3, bucket: str, publish_lock: dict) -> bool:
     if not _publish_lock_is_owned(s3, bucket, publish_lock):
         return False
     kwargs = {"Bucket": bucket, "Key": key}
-    if publish_lock.get("etag"):
+    if publish_lock.get("version_id"):
+        kwargs["VersionId"] = publish_lock["version_id"]
+    elif publish_lock.get("etag"):
         kwargs["IfMatch"] = publish_lock["etag"]
     try:
         s3.delete_object(**kwargs)
@@ -1512,12 +2405,27 @@ def _release_publish_lock(s3, bucket: str, publish_lock: dict) -> bool:
 
 
 def _publish_lock_is_owned(s3, bucket: str, publish_lock: dict) -> bool:
+    expected_etag = str(publish_lock.get("etag") or "").strip('"') or None
+    expected_version = publish_lock.get("version_id")
     try:
+        before = head_object(s3, bucket, publish_lock["key"])
+        if before is None:
+            return False
+        if expected_etag and before.get("etag") != expected_etag:
+            return False
+        if expected_version and before.get("version_id") != expected_version:
+            return False
         current = json.loads(get_object_bytes(
             s3, bucket, publish_lock["key"]))
+        after = head_object(s3, bucket, publish_lock["key"])
     except Exception:
         return False
-    return current.get("owner") == publish_lock["owner"]
+    if before != after:
+        return False
+    return (
+        isinstance(current, dict)
+        and current.get("owner") == publish_lock["owner"]
+    )
 
 
 def _upload_sample(s3, bucket: str, prefix: str, sample: dict, source_path: str) -> None:
@@ -1710,9 +2618,9 @@ def _dataset_status(s3, bucket: str, dataset_id: str,
 
 
 def _doctor_result(ctx, controller_url: str | None, skip_controller: bool) -> dict:
-    s3 = ctx.obj["s3"]
+    s3 = _get_s3(ctx)
     bucket = ctx.obj["bucket"]
-    ctrl_url = controller_url or ctx.obj.get("controller_url")
+    ctrl_url, ctrl_token = _controller_connection(ctx, controller_url)
     checks = []
 
     def add(name: str, status: str, detail: str) -> None:
@@ -1755,10 +2663,9 @@ def _doctor_result(ctx, controller_url: str | None, skip_controller: bool) -> di
         try:
             controller_payload = controller_api.health(ctrl_url)
             add("Controller health", "OK", controller_payload.get("status", "ok"))
-            controller_token = ctx.obj.get("controller_token")
-            if controller_token:
+            if ctrl_token:
                 controller_datasets = controller_api.datasets(
-                    ctrl_url, token=controller_token)
+                    ctrl_url, token=ctrl_token)
                 add("Controller datasets", "OK", str(len(controller_datasets)))
             else:
                 add("Controller operator API", "WARN", "token not configured")

@@ -13,28 +13,35 @@ Python 3.10 or newer is required.
 
 ## Create a store
 
-`dsimaging-admin store init` provisions the configured backend. With MinIO it
-writes a Docker Compose project for MinIO plus the `dsimaging-store` controller:
+The normal local path is one command:
 
 ```bash
-dsimaging-admin store init ./study-store
-dsimaging-admin store up ./study-store
-dsimaging-admin store doctor ./study-store
+dsimaging-admin store setup ./study-store
+```
+
+It checks Docker Compose before creating anything, creates or validates the
+project, starts MinIO and the controller, waits for the complete doctor, and
+saves `study-store` as the active profile. Repeating the command is
+non-destructive. Afterwards the lifecycle commands can omit their path:
+
+```bash
+dsimaging-admin store ps
+dsimaging-admin store doctor
+dsimaging-admin store down
 ```
 
 The generated project pins the published multi-architecture controller, MinIO
 and MinIO client images by both release tag and manifest-list digest. Use
 `--controller-image` only to select a deliberate controller upgrade.
 The controller image is also directly available as
-`davidsarrat/dsimaging-store:0.3.10` for `linux/amd64` and `linux/arm64`.
+`davidsarrat/dsimaging-store:0.3.11` for `linux/amd64` and `linux/arm64`.
 
 New local projects generate unique MinIO credentials and an operator token in
 `./study-store/.env` (mode `0600`). MinIO's API, console and controller are
-bound to `127.0.0.1` by default. Configure a CLI profile from those generated
-values before running dataset commands; no shared MinIO credential is built in.
-Credentials from an existing connection profile are not reused for a new
-store. Pass `store init --access-key ... --secret-key ...` only when an
-explicit provisioning override is required.
+bound to `127.0.0.1` by default. The saved YAML profile contains only the
+project path; credentials are resolved from its private `.env` at execution
+time and are not copied into `~/.dsimaging.yaml`. No shared MinIO credential is
+built in.
 
 For local controller development, build from a checked-out `dsimaging-store`
 repo instead of using an image:
@@ -45,13 +52,13 @@ dsimaging-admin store init ./study-store \
 dsimaging-admin store up ./study-store
 ```
 
-With AWS it creates and wires the S3 data plane and SQS notification plane. It
-uses boto3's default credential chain unless `--access-key` and `--secret-key`
-are supplied explicitly:
+For AWS, create a non-secret profile and provision its S3/SQS control plane. It
+uses boto3's normal credential chain:
 
 ```bash
-dsimaging-admin --backend aws --region eu-west-1 --bucket my-imaging \
-  store init ./aws-store \
+dsimaging-admin profile add aws-prod \
+  --backend aws --region eu-west-1 --bucket my-imaging
+dsimaging-admin --profile aws-prod store provision \
   --kms-key arn:aws:kms:eu-west-1:111122223333:key/...
 ```
 
@@ -67,22 +74,27 @@ uses SSE-KMS, grant `kms:Decrypt` for the selected key as well. Keep the usual
 write/delete permissions limited to identities that actually publish or
 modify collections.
 
-Use the generated connection details as a reusable CLI profile:
+Existing S3-compatible stores are connect-only:
 
 ```bash
-dsimaging-admin init \
-  --endpoint http://127.0.0.1:9000 \
-  --controller-url http://127.0.0.1:8080 \
-  --bucket imaging-data
+dsimaging-admin profile add lab-s3 --backend s3-compatible \
+  --endpoint https://s3.example.org --bucket imaging
+dsimaging-admin --profile lab-s3 doctor
 ```
+
+Keep remote credentials in environment variables or the provider credential
+chain. Endpoint and controller URLs containing userinfo, query strings, or
+fragments are rejected so credentials cannot be hidden in a persisted URL.
 
 ## Dataset operations
 
 ```bash
-# Publish with staging, a publish lock and DICOM checks.
-dsimaging-admin dataset publish \
-  --dataset-id study_ct_v1 \
-  --source /data/study_ct \
+# Common path: SOURCE/metadata.csv (or .parquet) is inferred when unique.
+dsimaging-admin dataset publish study_ct_v1 /data/study_ct \
+  --modality ct
+
+# Advanced metadata/label contract.
+dsimaging-admin dataset publish study_ct_v2 /data/study_ct \
   --metadata /data/study_ct/clinical.csv \
   --privacy-unit-column patient_id \
   --label-column diagnosis \
@@ -107,11 +119,12 @@ dsimaging-admin dataset download study_ct_v1 ./debug/study_ct_v1
 dsimaging-admin dataset delete study_ct_v1 --yes
 ```
 
-Ordinary deletion preserves version history. Permanently removing every object
-version and delete marker is a separate, irreversible operator decision:
+Ordinary deletion requires bucket versioning and preserves recoverable history.
+Permanently removing every object version and delete marker is a separate,
+irreversible operator decision:
 
 ```bash
-dsimaging-admin dataset delete study_ct_v1 --yes --purge-versions
+dsimaging-admin dataset purge study_ct_v1 --yes --confirm study_ct_v1
 ```
 
 The former top-level dataset commands (`publish`, `list`, `status`, `verify`,
@@ -129,9 +142,11 @@ dsimaging-admin ui launch
 ```
 
 The dashboard is deliberately loopback-only; use an SSH tunnel when operating
-it remotely. Stored access keys, secret keys and controller tokens are never
-prefilled into browser widget state. Enter any credentials needed for that UI
-session explicitly, or use the CLI profile directly.
+it remotely. Secret widgets are never prefilled. A local-store profile resolves
+its private `.env` only in the server-side process; changing profile, endpoint,
+backend, or controller URL clears session-entered credentials for the old
+destination. Remote credentials come from the process environment/provider
+chain or are entered for that UI session.
 
 By default it binds to `127.0.0.1:8501`. This is an operator-only tool for
 administrators with storage access: it has full visibility of bucket paths,
@@ -154,6 +169,11 @@ dsimaging-admin doctor --output json
 
 ## What `publish` does
 
+Recognized source formats are NIfTI (`.nii`, `.nii.gz`), NRRD, MetaImage
+(`.mha`, `.mhd`), DICOM, whole-slide SVS, TIFF, PNG, and JPEG. The store is
+format-agnostic after publication; an analysis job still needs a compatible
+reader for the selected format.
+
 1. Scans your local image directory and optional masks under `source/masks/`,
    `masks/`, `source/labels/`, or `labels/`.
 2. Runs basic DICOM sanity checks for series UID, modality and instance order.
@@ -171,6 +191,9 @@ dsimaging-admin doctor --output json
 Use `--dry-run` to scan and show the upload plan without S3 writes. Published
 datasets always use staging and an atomic publication lock; `--no-atomic` is
 retained only to produce an explicit compatibility error.
+The UI preflight fingerprints every image, mask, and metadata file. It rescans
+before publishing, while the atomic uploader compares the uploaded hashes with
+the local scan and rolls back if a file changes mid-upload.
 
 Every publication pins this disclosure-control contract under `manifest.yaml`'s
 `metadata` mapping:
@@ -184,8 +207,10 @@ label_col: diagnosis  # omitted when --label-column is not supplied
 label_levels: [case, control]  # omitted unless explicitly approved by the operator
 ```
 
-`--privacy-unit-column` is required. Every discovered sample must have a
-non-empty value in that metadata column and, when declared, in `--label-column`.
+When the metadata contains an exact `patient_id` column it is selected as the
+privacy unit; otherwise `--privacy-unit-column` is required. Every discovered
+sample must have a non-empty value in that metadata column and, when declared,
+in `--label-column`.
 Repeat `--public-label-level` to declare the finite label vocabulary that may be
 used by disclosure-controlled aggregate results. Undeclared values, unsafe
 identifiers, duplicates, and values equal to sample or patient identifiers are
@@ -210,22 +235,19 @@ incomplete replacement metadata fails without rewriting the manifest. Use
 
 ## Configuration
 
-`~/.dsimaging.yaml` supports multiple profiles:
+`~/.dsimaging.yaml` supports multiple non-secret profiles. A local setup stores
+only a pointer:
 
 ```yaml
-default_profile: default
+default_profile: study-store
 profiles:
-  default:
-    backend: auto
-    endpoint: http://127.0.0.1:9000
-    controller_url: http://127.0.0.1:8080
-    controller_token: <operator token>
-    bucket: imaging-data
-    access_key: <value from the store .env MINIO_ROOT_USER>
-    secret_key: <value from the store .env MINIO_ROOT_PASSWORD>
-    region: ""
-    aws:
-      sqs_queue_url: ""
+  study-store:
+    kind: local-store
+    store_path: /absolute/path/to/study-store
+  aws-prod:
+    backend: aws
+    bucket: imaging-prod
+    region: eu-west-1
 ```
 
 Environment variables override profile values:
@@ -233,7 +255,7 @@ Environment variables override profile values:
 | Variable | Default | Description |
 |---|---|---|
 | `DSIMAGING_PROFILE` | configured `default_profile`, then `default` | Config profile |
-| `DSIMAGING_ENDPOINT` | `http://127.0.0.1:9000` | S3/MinIO endpoint |
+| `DSIMAGING_ENDPOINT` | local MinIO URL; empty for AWS | S3/MinIO endpoint |
 | `DSIMAGING_CONTROLLER_URL` | (empty) | dsimaging-store controller URL |
 | `DSIMAGING_CONTROLLER_TOKEN` | (empty) | Bearer token for controller inventory and manual reconcile |
 | `DSIMAGING_ACCESS_KEY` | unset | S3 access key (required for local MinIO) |
@@ -241,11 +263,13 @@ Environment variables override profile values:
 | `DSIMAGING_BUCKET` | `imaging-data` | Bucket name |
 | `DSIMAGING_REGION` | (empty) | S3 region |
 | `DSIMAGING_BACKEND` | `auto` | Backend override: `auto`, `minio`, `aws` or `s3-compatible` |
+| `DSIMAGING_SQS_QUEUE_URL` | profile value, then unset | AWS controller event queue URL |
 
-`store init` generates a controller token in the project's `.env`, whose mode
-is set to `0600`. Pass that value through `DSIMAGING_CONTROLLER_TOKEN` (or the
-profile key above) when using `dataset list`, `dataset status`, `dataset
-reconcile`, `doctor`, or the operator UI with the controller. The controller's
+`store setup` generates a controller token in the project's `.env`, whose mode
+is set to `0600`, and resolves it automatically through the local-store pointer.
+For a separately deployed controller, pass it through
+`DSIMAGING_CONTROLLER_TOKEN`. Tokens are scoped to the exact configured
+controller URL and are dropped if a command changes that URL. The controller's
 unauthenticated health endpoint reports only coarse liveness; inventory and
 manual reconciliation remain disabled until a token is configured. For a
 manually deployed MinIO or AWS controller, generate and configure the same
