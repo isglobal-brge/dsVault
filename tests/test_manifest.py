@@ -22,15 +22,25 @@ from dsimaging_admin.manifest import (
 
 
 class FakeBody(io.BytesIO):
-    pass
+    def __init__(self, payload):
+        super().__init__(payload)
+        self.bytes_read = 0
+
+    def read(self, size=-1):
+        chunk = super().read(size)
+        self.bytes_read += len(chunk)
+        return chunk
 
 
 class FakeS3:
     def __init__(self, objects):
         self.objects = objects
+        self.bodies = []
 
     def get_object(self, Bucket, Key):
-        return {"Body": FakeBody(self.objects[Key])}
+        body = FakeBody(self.objects[Key])
+        self.bodies.append(body)
+        return {"Body": body}
 
 
 class VersionedFakeS3:
@@ -72,6 +82,74 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(samples[0]["source_kind"], "dicom_series")
         self.assertEqual(len(samples[0]["files"]), 2)
 
+    def test_local_scans_reject_detached_image_and_mask_containers(self):
+        cases = (
+            ("mhd", b"ObjectType = Image\nElementDataFile = payload.raw\n",
+             "MHD files are not supported"),
+            ("nrrd", b"NRRD0005\r\ntype: uchar\r\nDaTa FiLe : LIST\r\n\r\n",
+             "Detached NRRD"),
+            ("mha", b"ObjectType = Image\nElementDataFile = payload.raw\n",
+             "Detached MetaImage"),
+        )
+        for extension, payload, message in cases:
+            with self.subTest(asset="image", extension=extension), \
+                    tempfile.TemporaryDirectory() as tmpdir:
+                images = os.path.join(tmpdir, "images")
+                os.makedirs(images)
+                with open(os.path.join(images, f"case.{extension}"), "wb") as f:
+                    f.write(payload)
+                with open(os.path.join(images, "payload.raw"), "wb") as f:
+                    f.write(b"pixels")
+                with self.assertRaisesRegex(ValueError, message):
+                    scan_images(tmpdir)
+
+            with self.subTest(asset="mask", extension=extension), \
+                    tempfile.TemporaryDirectory() as tmpdir:
+                masks = os.path.join(tmpdir, "masks")
+                os.makedirs(masks)
+                with open(os.path.join(masks, f"case_mask.{extension}"), "wb") as f:
+                    f.write(payload)
+                with open(os.path.join(masks, "payload.raw"), "wb") as f:
+                    f.write(b"pixels")
+                with self.assertRaisesRegex(ValueError, message):
+                    scan_masks(tmpdir, sample_ids=["case"])
+
+    def test_local_scans_accept_inline_nrrd_mha_images_and_masks(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            images = os.path.join(tmpdir, "images")
+            masks = os.path.join(tmpdir, "masks")
+            os.makedirs(images)
+            os.makedirs(masks)
+            payloads = {
+                "inline_nrrd.nrrd": (
+                    b"NRRD0005\ntype: uchar\ndimension: 2\nsizes: 1 1\n"
+                    b"encoding: raw\n\n\x01"
+                ),
+                "inline_mha.mha": (
+                    b"ObjectType = Image\r\nNDims = 2\r\nDimSize = 1 1\r\n"
+                    b"ElementType = MET_UCHAR\r\neLeMeNtDaTaFiLe   =   local\r\n\x01"
+                ),
+            }
+            for filename, payload in payloads.items():
+                with open(os.path.join(images, filename), "wb") as f:
+                    f.write(payload)
+                stem, extension = filename.split(".", 1)
+                with open(os.path.join(masks, f"{stem}_mask.{extension}"), "wb") as f:
+                    f.write(payload)
+
+            samples = scan_images(tmpdir)
+            scanned_masks = scan_masks(
+                tmpdir, sample_ids=[sample["sample_id"] for sample in samples])
+
+        self.assertEqual(
+            [sample["sample_id"] for sample in samples],
+            ["inline_mha", "inline_nrrd"],
+        )
+        self.assertEqual(
+            [mask["sample_id"] for mask in scanned_masks],
+            ["inline_mha", "inline_nrrd"],
+        )
+
     def test_scan_s3_images_groups_single_files_and_dicom(self):
         bucket = "imaging-data"
         prefix = "datasets/study_ct_v1"
@@ -93,6 +171,160 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(samples[0]["uri_path"], "a.nii.gz")
         self.assertEqual(samples[1]["source_kind"], "dicom_series")
         self.assertEqual(len(samples[1]["files"]), 2)
+
+    def test_s3_scans_used_by_controller_reject_detached_containers(self):
+        bucket = "imaging-data"
+        prefix = "datasets/study_ct_v1"
+        cases = (
+            ("mhd", b"ObjectType = Image\nElementDataFile = payload.raw\n",
+             "MHD files are not supported"),
+            ("nrrd", b"NRRD0005\r\ntype: uchar\r\nDaTa FiLe : LIST\r\n\r\n",
+             "Detached NRRD"),
+            ("mha", b"ObjectType = Image\nElementDataFile = payload.raw\n",
+             "Detached MetaImage"),
+        )
+        for extension, payload, message in cases:
+            image_key = f"{prefix}/source/images/case.{extension}"
+            with self.subTest(asset="image", extension=extension):
+                with self.assertRaisesRegex(ValueError, message):
+                    scan_s3_images(
+                        FakeS3({image_key: payload}), bucket, prefix,
+                        [{"key": image_key, "size": len(payload)}],
+                    )
+
+            mask_key = f"{prefix}/source/masks/case_mask.{extension}"
+            with self.subTest(asset="mask", extension=extension):
+                with self.assertRaisesRegex(ValueError, message):
+                    scan_s3_masks(
+                        FakeS3({mask_key: payload}), bucket, prefix,
+                        [{"key": mask_key, "size": len(payload)}],
+                        sample_ids=["case"],
+                    )
+
+    def test_s3_detached_headers_stop_reading_before_large_payloads(self):
+        bucket = "imaging-data"
+        prefix = "datasets/study_ct_v1"
+        cases = (
+            ("nrrd", b"NRRD0005\ntype: uchar\ndatafile: LIST\n\n"),
+            ("mha", b"ObjectType = Image\nElementDataFile = payload.raw\n"),
+        )
+        for extension, header in cases:
+            payload = header + b"x" * (2 * 1024 * 1024)
+            key = f"{prefix}/source/images/case.{extension}"
+            s3 = FakeS3({key: payload})
+
+            with self.subTest(extension=extension), \
+                    self.assertRaisesRegex(ValueError, "Detached"):
+                scan_s3_images(
+                    s3, bucket, prefix,
+                    [{"key": key, "size": len(payload)}],
+                )
+
+            self.assertEqual(len(s3.bodies), 1)
+            self.assertLessEqual(s3.bodies[0].bytes_read, 65536)
+            self.assertLess(s3.bodies[0].bytes_read, len(payload))
+            self.assertTrue(s3.bodies[0].closed)
+
+    def test_s3_malformed_headers_are_bounded_by_the_header_limit(self):
+        bucket = "imaging-data"
+        prefix = "datasets/study_ct_v1"
+        cases = (
+            ("nrrd", b"NRRD0005\n" + b"# comment\n" * 200000),
+            ("mha", b"ObjectType = Image\n" + b"Comment = value\n" * 150000),
+        )
+        for extension, payload in cases:
+            key = f"{prefix}/source/images/case.{extension}"
+            s3 = FakeS3({key: payload})
+
+            with self.subTest(extension=extension), \
+                    self.assertRaisesRegex(ValueError, "safety limit"):
+                scan_s3_images(
+                    s3, bucket, prefix,
+                    [{"key": key, "size": len(payload)}],
+                )
+
+            self.assertLessEqual(s3.bodies[0].bytes_read, 1024 * 1024 + 1)
+            self.assertLess(s3.bodies[0].bytes_read, len(payload))
+            self.assertTrue(s3.bodies[0].closed)
+
+    def test_s3_mhd_is_rejected_without_opening_the_object(self):
+        bucket = "imaging-data"
+        prefix = "datasets/study_ct_v1"
+        key = f"{prefix}/source/images/case.mhd"
+        s3 = FakeS3({
+            key: b"ObjectType = Image\nElementDataFile = LOCAL\n\x01",
+        })
+
+        with self.assertRaisesRegex(ValueError, "MHD files are not supported"):
+            scan_s3_images(
+                s3, bucket, prefix,
+                [{"key": key, "size": len(s3.objects[key])}],
+            )
+
+        self.assertEqual(s3.bodies, [])
+
+    def test_s3_scans_accept_and_hash_versioned_inline_images_and_masks(self):
+        bucket = "imaging-data"
+        prefix = "datasets/study_ct_v1"
+        inline = {
+            "inline_nrrd.nrrd": (
+                b"NRRD0005\ntype: uchar\ndimension: 2\nsizes: 1 1\n"
+                b"encoding: raw\n\n\x01"
+            ),
+            "inline_mha.mha": (
+                b"ObjectType = Image\r\nNDims = 2\r\nDimSize = 1 1\r\n"
+                b"ElementType = MET_UCHAR\r\neLeMeNtDaTaFiLe   =   local\r\n\x01"
+            ),
+        }
+        image_payloads = {
+            f"{prefix}/source/images/{name}": payload
+            for name, payload in inline.items()
+        }
+        mask_payloads = {
+            f"{prefix}/source/masks/{name.replace('.', '_mask.', 1)}": payload
+            for name, payload in inline.items()
+        }
+        payloads = image_payloads | mask_payloads
+        versions = {(key, "version-1"): payload
+                    for key, payload in payloads.items()}
+        s3 = VersionedFakeS3(
+            {key: b"different-current-value" for key in payloads}, versions)
+        image_objects = [
+            {"key": key, "size": len(payload), "version_id": "version-1"}
+            for key, payload in image_payloads.items()
+        ]
+        mask_objects = [
+            {"key": key, "size": len(payload), "version_id": "version-1"}
+            for key, payload in mask_payloads.items()
+        ]
+
+        samples = scan_s3_images(s3, bucket, prefix, image_objects)
+        masks = scan_s3_masks(
+            s3, bucket, prefix, mask_objects,
+            sample_ids=[sample["sample_id"] for sample in samples],
+        )
+
+        self.assertEqual(
+            [sample["sample_id"] for sample in samples],
+            ["inline_mha", "inline_nrrd"],
+        )
+        self.assertEqual(
+            [mask["sample_id"] for mask in masks],
+            ["inline_mha", "inline_nrrd"],
+        )
+        expected_hashes = {
+            hashlib.sha256(payload).hexdigest() for payload in inline.values()
+        }
+        self.assertEqual(
+            {item["content_hash"] for item in samples + masks}, expected_hashes)
+        self.assertTrue(all(
+            item["content_hash_version_id"] == "version-1"
+            for item in samples + masks
+        ))
+        self.assertCountEqual(
+            s3.requests,
+            [(key, "version-1") for key in payloads],
+        )
 
     def test_scan_s3_assets_hash_the_recorded_object_versions(self):
         bucket = "imaging-data"

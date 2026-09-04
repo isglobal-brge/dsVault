@@ -1,5 +1,11 @@
 # NEWS
 
+## 0.3.14
+
+- Publication and controller rescans reject MHD and detached NRRD/MHA
+  containers for both images and masks, preventing incomplete sidecar-backed
+  samples from being recorded as valid single-file assets.
+
 ## 0.3.13
 
 - `store setup PATH` now provides the normal idempotent local workflow: it

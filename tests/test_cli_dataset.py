@@ -33,6 +33,27 @@ class DatasetCliTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertNotIn("--no-skip", result.output)
+        self.assertIn("MHD and detached NRRD/MHA", result.output)
+
+    def test_publish_rejects_detached_container_before_opening_s3(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = os.path.join(tmpdir, "source")
+            images = os.path.join(source, "images")
+            os.makedirs(images)
+            with open(os.path.join(images, "case.mhd"), "wb") as f:
+                f.write(
+                    b"ObjectType = Image\nElementDataFile = case.raw\n")
+            with open(os.path.join(images, "case.raw"), "wb") as f:
+                f.write(b"pixels")
+            with patch("dsimaging_admin.cli._get_s3") as get_s3:
+                result = CliRunner().invoke(main, [
+                    "dataset", "publish", "study", source,
+                    "--skip-dicom-checks", "--dry-run",
+                ])
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("MHD files are not supported", result.output)
+        get_s3.assert_not_called()
 
     def test_non_atomic_publication_is_disabled(self):
         result = CliRunner().invoke(main, [

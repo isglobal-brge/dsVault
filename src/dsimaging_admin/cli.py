@@ -1252,7 +1252,7 @@ def store_doctor_cmd(ctx, path, output):
                 type=click.Path(exists=True))
 @click.option("--dataset-id", "dataset_id_option", help="Dataset identifier")
 @click.option("--source", "source_option", type=click.Path(exists=True),
-              help="Local directory containing images")
+              help="Local directory containing self-contained images")
 @click.option("--metadata", default=None, type=click.Path(exists=True, dir_okay=False),
               help="CSV/Parquet metadata required by the patient privacy contract")
 @click.option("--privacy-unit-column", default=None,
@@ -1276,7 +1276,11 @@ def store_doctor_cmd(ctx, path, output):
 def publish(ctx, dataset_id_arg, source_arg, dataset_id_option, source_option,
             metadata, privacy_unit_column, label_column, label_levels, modality,
             replace, atomic, dry_run, skip_dicom_checks, verify_mode):
-    """Publish a local dataset to S3/MinIO."""
+    """Publish a local dataset to S3/MinIO.
+
+    SOURCE accepts single-file image containers. MHD and detached NRRD/MHA
+    sidecars are rejected; use inline NRRD/MHA or NIfTI instead.
+    """
     dataset_id = _coalesce_argument_option(
         dataset_id_arg, dataset_id_option, "dataset_id")
     source = _coalesce_argument_option(
@@ -1291,7 +1295,10 @@ def publish(ctx, dataset_id_arg, source_arg, dataset_id_option, source_option,
         raise click.ClickException(str(e)) from e
 
     click.echo(f"[1/5] Scanning images for {dataset_id}...")
-    samples = scan_images(source)
+    try:
+        samples = scan_images(source)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
     if not samples:
         raise click.ClickException("No image files found.")
     click.echo(f"      Found {len(samples)} samples")
@@ -1302,7 +1309,11 @@ def publish(ctx, dataset_id_arg, source_arg, dataset_id_option, source_option,
             click.echo(click.style(f"      WARN: {warning}", fg="yellow"))
 
     click.echo("[2/5] Scanning masks and metadata...")
-    masks = scan_masks(source, sample_ids=[sample["sample_id"] for sample in samples])
+    try:
+        masks = scan_masks(
+            source, sample_ids=[sample["sample_id"] for sample in samples])
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
     click.echo(f"      Found {len(masks)} masks" if masks else "      No masks found")
 
     metadata = _publication_metadata(source, metadata)

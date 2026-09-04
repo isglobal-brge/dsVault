@@ -22,6 +22,7 @@ PRIVACY_UNIT = "patient"
 PRIVACY_UNIT_CANONICALIZATION = "trim-utf8-v2"
 _ASCII_ID_TRIM = " \t\r\n"
 _MAX_PRIVACY_UNIT_BYTES = 4096
+_MAX_MEDICAL_HEADER_BYTES = 1024 * 1024
 _MISSING_VALUES = {"na", "nan", "null", "<na>", "nat"}
 _RESOURCE_FIELDS = (
     "uri", "file", "path", "root", "manifest",
@@ -57,6 +58,7 @@ def scan_images(source_dir: str) -> list[dict]:
 
         if os.path.isfile(filepath) and is_image_file(entry):
             _validate_relative_asset_path(entry)
+            _validate_local_image_container(filepath, entry)
             samples.append({
                 "sample_id": sample_id_from_filename(entry),
                 "source_kind": "single_file",
@@ -176,6 +178,7 @@ def scan_masks(source_dir: str, sample_ids: list[str] | None = None) -> list[dic
                 raise ValueError("symbolic links are not allowed in mask collections")
             rel = os.path.relpath(filepath, masks_dir).replace(os.sep, "/")
             _validate_relative_asset_path(rel)
+            _validate_local_image_container(filepath, entry)
             masks.append({
                 "sample_id": _sample_id_from_mask_filename(entry, sample_ids),
                 "source_kind": "mask_file",
@@ -223,9 +226,10 @@ def scan_s3_images(s3, bucket: str, prefix: str, objects: list[dict]) -> list[di
 
     samples = []
     for rel, obj in sorted(single_files, key=lambda item: item[0]):
-        content_hash = _sha256_s3_object(
-            s3, bucket, obj["key"], obj.get("version_id"))
         filename = rel.rsplit("/", 1)[-1]
+        content_hash = _sha256_s3_object(
+            s3, bucket, obj["key"], obj.get("version_id"),
+            container_name=filename)
         samples.append({
             "sample_id": sample_id_from_filename(filename),
             "source_kind": "single_file",
@@ -295,7 +299,8 @@ def scan_s3_masks(s3, bucket: str, prefix: str, objects: list[dict],
             continue
         _validate_relative_asset_path(rel)
         content_hash = _sha256_s3_object(
-            s3, bucket, key, obj.get("version_id"))
+            s3, bucket, key, obj.get("version_id"),
+            container_name=filename)
         masks.append({
             "sample_id": _sample_id_from_mask_filename(filename, sample_ids),
             "source_kind": "mask_file",
@@ -902,8 +907,79 @@ def _sample_id_from_mask_filename(filename: str,
     return stripped or stem
 
 
+def _validate_image_container_header(filename: str, prefix: bytes, *,
+                                     complete: bool) -> bool:
+    """Validate a bounded header, returning whether it is complete and inline."""
+    lower = filename.lower()
+    if lower.endswith(".mhd"):
+        raise ValueError(
+            "MHD files are not supported; convert to self-contained .mha or NIfTI"
+        )
+    if lower.endswith(".nrrd"):
+        separators = [position for position in (
+            prefix.find(b"\n\n"), prefix.find(b"\r\n\r\n")
+        ) if position >= 0]
+        if not separators:
+            if not complete and len(prefix) <= _MAX_MEDICAL_HEADER_BYTES:
+                return False
+            raise ValueError("NRRD header is invalid or exceeds the safety limit")
+        header_end = min(separators)
+        if header_end > _MAX_MEDICAL_HEADER_BYTES:
+            raise ValueError("NRRD header is invalid or exceeds the safety limit")
+        header = prefix[:header_end]
+        for line in header.splitlines():
+            line = line.strip()
+            if not line or line.startswith(b"#") or b":" not in line:
+                continue
+            key_name = re.sub(
+                br"\s+", b"", line.split(b":", 1)[0].strip().lower())
+            if key_name == b"datafile":
+                raise ValueError(
+                    "Detached NRRD files are not supported; "
+                    "use a self-contained NRRD or NIfTI"
+                )
+        return True
+    if lower.endswith(".mha"):
+        lines = prefix.splitlines()
+        if not complete and not prefix.endswith((b"\n", b"\r")):
+            lines = lines[:-1]
+        for line in lines:
+            key_name, separator, value = line.partition(b"=")
+            if separator and key_name.strip().lower() == b"elementdatafile":
+                if value.strip().upper() != b"LOCAL":
+                    raise ValueError(
+                        "Detached MetaImage files are not supported; "
+                        "use self-contained .mha or NIfTI"
+                    )
+                return True
+        if not complete and len(prefix) <= _MAX_MEDICAL_HEADER_BYTES:
+            return False
+        raise ValueError("MetaImage header is invalid or exceeds the safety limit")
+    return True
+
+
+def _validate_local_image_container(path: str, filename: str) -> None:
+    lower = filename.lower()
+    if lower.endswith(".mhd"):
+        _validate_image_container_header(filename, b"", complete=True)
+    if not lower.endswith((".nrrd", ".mha")):
+        return
+    with open(path, "rb") as stream:
+        prefix = stream.read(_MAX_MEDICAL_HEADER_BYTES + 1)
+    _validate_image_container_header(filename, prefix, complete=True)
+
+
 def _sha256_s3_object(s3, bucket: str, key: str,
-                      version_id: str | None = None) -> str:
+                      version_id: str | None = None, *,
+                      container_name: str | None = None) -> str:
+    if container_name and container_name.lower().endswith(".mhd"):
+        _validate_image_container_header(
+            container_name, b"", complete=True)
+    inspect_header = bool(
+        container_name and
+        container_name.lower().endswith((".nrrd", ".mha"))
+    )
+    prefix = bytearray()
     h = hashlib.sha256()
     request = {"Bucket": bucket, "Key": key}
     if version_id not in (None, "", "null"):
@@ -911,6 +987,15 @@ def _sha256_s3_object(s3, bucket: str, key: str,
     response = s3.get_object(**request)
     body = response["Body"]
     try:
+        header_complete = not inspect_header
+        while not header_complete:
+            remaining = _MAX_MEDICAL_HEADER_BYTES + 1 - len(prefix)
+            chunk = body.read(min(65536, remaining)) if remaining > 0 else b""
+            if chunk:
+                h.update(chunk)
+                prefix.extend(chunk)
+            header_complete = _validate_image_container_header(
+                container_name, bytes(prefix), complete=not chunk)
         for chunk in iter(lambda: body.read(65536), b""):
             if chunk:
                 h.update(chunk)

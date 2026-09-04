@@ -169,8 +169,10 @@ dsimaging-admin doctor --output json
 
 ## What `publish` does
 
-Recognized source formats are NIfTI (`.nii`, `.nii.gz`), NRRD, MetaImage
-(`.mha`, `.mhd`), DICOM, whole-slide SVS, TIFF, PNG, and JPEG. The store is
+Recognized single-file source formats are NIfTI (`.nii`, `.nii.gz`), inline
+NRRD (`.nrrd`), inline MetaImage (`.mha`), DICOM, whole-slide SVS, TIFF, PNG,
+and JPEG. `.mhd` and detached NRRD/MHA sidecars are rejected; convert them to
+self-contained NRRD/MHA or NIfTI before publication. The store is
 format-agnostic after publication; an analysis job still needs a compatible
 reader for the selected format.
 
