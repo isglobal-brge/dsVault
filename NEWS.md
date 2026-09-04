@@ -1,5 +1,11 @@
 # NEWS
 
+## 0.3.16
+
+- New local stores pin the multi-architecture `dsimaging-store` 0.3.14
+  controller image, which enforces the same dataset identifier contract at
+  every direct-upload and reconciliation boundary.
+
 ## 0.3.15
 
 - Local scans reject multiple populated image or mask roots instead of silently

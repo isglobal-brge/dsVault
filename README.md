@@ -42,7 +42,7 @@ and MinIO client images by both release tag and manifest-list digest. To select
 a deliberate controller upgrade, pass `--controller-image IMAGE` to
 `store init` before running `store up`; `store setup` uses the pinned default.
 The controller image is also directly available as
-`davidsarrat/dsimaging-store:0.3.13` for `linux/amd64` and `linux/arm64`.
+`davidsarrat/dsimaging-store:0.3.14` for `linux/amd64` and `linux/arm64`.
 
 New local projects generate unique MinIO credentials and an operator token in
 `./study-store/.env` (mode `0600`). MinIO's API, console and controller are
