@@ -9,6 +9,13 @@ medical imaging datasets stored in them.
 pip install dsimaging-admin
 ```
 
+To use the current `main` before its next PyPI release:
+
+```bash
+python -m pip install --upgrade \
+  "git+https://github.com/isglobal-brge/dsimaging-admin.git@main"
+```
+
 Python 3.10 or newer is required.
 
 ## Create a store
