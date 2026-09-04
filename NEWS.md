@@ -5,6 +5,8 @@
 - Publication and controller rescans reject MHD and detached NRRD/MHA
   containers for both images and masks, preventing incomplete sidecar-backed
   samples from being recorded as valid single-file assets.
+- New local stores pin the multi-architecture `dsimaging-store` 0.3.12
+  controller image by digest.
 
 ## 0.3.13
 
