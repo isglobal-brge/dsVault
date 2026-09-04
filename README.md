@@ -38,10 +38,11 @@ dsimaging-admin store down
 ```
 
 The generated project pins the published multi-architecture controller, MinIO
-and MinIO client images by both release tag and manifest-list digest. Use
-`--controller-image` only to select a deliberate controller upgrade.
+and MinIO client images by both release tag and manifest-list digest. To select
+a deliberate controller upgrade, pass `--controller-image IMAGE` to
+`store init` before running `store up`; `store setup` uses the pinned default.
 The controller image is also directly available as
-`davidsarrat/dsimaging-store:0.3.12` for `linux/amd64` and `linux/arm64`.
+`davidsarrat/dsimaging-store:0.3.13` for `linux/amd64` and `linux/arm64`.
 
 New local projects generate unique MinIO credentials and an operator token in
 `./study-store/.env` (mode `0600`). MinIO's API, console and controller are
@@ -138,6 +139,51 @@ The former top-level dataset commands (`publish`, `list`, `status`, `verify`,
 `delete`, `download`, `copy`, `rescan`, `reconcile`) remain as deprecated aliases
 and print a warning before delegating to the `dataset` subgroup.
 
+## DataSHIELD resource handoff
+
+Generate an inert, reviewable plan after publishing and verifying a dataset:
+
+```bash
+# Opal: the resource endpoint must be reachable from the Opal R server.
+dsimaging-admin --profile study-store dataset resource-plan study_ct_v1 \
+  --target opal --project IMAGING \
+  --resource-endpoint https://s3.internal.example.org \
+  > study_ct_v1.opal-resource-plan.yaml
+
+# Armadillo: storage details live in the protected dsImaging node registry;
+# the Armadillo Resource itself points only at an inert marker table.
+dsimaging-admin --profile study-store dataset resource-plan study_ct_v1 \
+  --target armadillo --project imaging \
+  --armadillo-url https://armadillo.example.org \
+  --resource-endpoint https://s3.internal.example.org \
+  --credentials-ref imaging_store_ro \
+  > study_ct_v1.armadillo-resource-plan.yaml
+```
+
+The command strictly reads and validates the selected dataset's
+`manifest.yaml`, then prints YAML containing the Resource fields and exact R
+administrator commands. It does not write to the store, alter profiles, or
+contact/register with Opal or Armadillo. It never prints profile credentials:
+the Opal plan refers only to `DSIMAGING_RESOURCE_ACCESS_KEY` and
+`DSIMAGING_RESOURCE_SECRET_KEY`, which should hold a dedicated read-only
+identity, while the Armadillo plan contains only the supplied protected
+`credentials_ref`. Run `dataset verify` immediately before applying a plan when
+an integrity check is required; plan generation validates the manifest contract
+but does not rehash the collection.
+
+Dataset IDs use at most 128 lowercase ASCII characters, start with a letter or
+digit, may otherwise contain dots, underscores and dashes, and cannot contain
+consecutive dots. Resource endpoints, buckets and regions must also satisfy the
+stricter dsImaging server-side locator contract; incompatible values fail before
+a plan is printed.
+
+`--resource-endpoint` may also come from `DSIMAGING_RESOURCE_ENDPOINT`. It is
+required when the selected profile uses `localhost`, `127.0.0.1`, or `::1`,
+because that address normally refers to the DataSHIELD server itself rather
+than the admin host. Armadillo project and object names use only letters,
+digits, and underscores; when `--name` is omitted, dots and dashes in its
+dataset ID are converted to underscores in the proposed Resource object name.
+
 ## Local operator UI
 
 The optional Streamlit dashboard wraps the same store and dataset operations in a
@@ -175,6 +221,28 @@ dsimaging-admin doctor --output json
 ```
 
 ## What `publish` does
+
+The recommended input tree is:
+
+```text
+study/
+  metadata.csv                 # or metadata.parquet, but not both
+  images/                      # alternatively source/images/ or files here
+    case001.nii.gz
+    case002/                   # one immediate directory per DICOM series
+      001.dcm
+      002.dcm
+  masks/                       # alternatively source/masks/, labels/, source/labels/
+    case001_mask.nii.gz
+    case002_seg.nii.gz
+```
+
+Use exactly one populated image root and one populated mask root. Publication
+fails if multiple supported roots contain assets, so no image or mask tree is
+silently ignored. Single-file images are read directly from the selected image
+root; only DICOM series use an immediate child directory. Mask scanning is
+recursive. Automatic metadata discovery checks only `metadata.csv` and
+`metadata.parquet` directly under `SOURCE`; use `--metadata` for any other path.
 
 Recognized single-file source formats are NIfTI (`.nii`, `.nii.gz`), inline
 NRRD (`.nrrd`), inline MetaImage (`.mha`), DICOM, whole-slide SVS, TIFF, PNG,

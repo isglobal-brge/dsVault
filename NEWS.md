@@ -1,5 +1,17 @@
 # NEWS
 
+## 0.3.15
+
+- Local scans reject multiple populated image or mask roots instead of silently
+  selecting the first root and omitting assets from publication.
+- Dataset identifiers now enforce the dsImaging resolver's 128-byte limit and
+  reject consecutive dots, preventing publication of unresolvable collections.
+- `dataset resource-plan DATASET_ID` emits read-only Opal or Armadillo handoff
+  YAML after validating the stored manifest. It neither registers a Resource
+  nor includes storage credentials.
+- New local stores pin the multi-architecture `dsimaging-store` 0.3.13
+  controller image by digest.
+
 ## 0.3.14
 
 - Publication and controller rescans reject MHD and detached NRRD/MHA

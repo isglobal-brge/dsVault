@@ -252,6 +252,11 @@ class AdminFeatureTests(unittest.TestCase):
         self.assertNotIn("grep -qi", init_script)
 
     def test_store_default_images_are_versioned_and_digest_pinned(self):
+        self.assertEqual(
+            DEFAULT_CONTROLLER_IMAGE,
+            "davidsarrat/dsimaging-store:0.3.13@"
+            "sha256:1104d660bc43b3886ce9d094070424a427936da39723b8ed47c0d7d12843c64f",
+        )
         for image in (
                 DEFAULT_CONTROLLER_IMAGE, DEFAULT_MINIO_IMAGE,
                 DEFAULT_MC_IMAGE):

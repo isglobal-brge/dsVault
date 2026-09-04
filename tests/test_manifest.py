@@ -59,8 +59,13 @@ class VersionedFakeS3:
 class ManifestTests(unittest.TestCase):
     def test_validate_dataset_id_rejects_unsafe_values(self):
         validate_dataset_id("study_ct_v1_site-a.v1")
+        validate_dataset_id("a" * 128)
         with self.assertRaises(ValueError):
             validate_dataset_id("../bad")
+        with self.assertRaises(ValueError):
+            validate_dataset_id("study..v1")
+        with self.assertRaises(ValueError):
+            validate_dataset_id("a" * 129)
         with self.assertRaises(ValueError):
             validate_dataset_id("Bad ID")
         with self.assertRaises(ValueError):
@@ -81,6 +86,66 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(samples[0]["sample_id"], "case001")
         self.assertEqual(samples[0]["source_kind"], "dicom_series")
         self.assertEqual(len(samples[0]["files"]), 2)
+
+    def test_scan_images_rejects_multiple_populated_roots(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            roots = (
+                os.path.join(tmpdir, "images"),
+                os.path.join(tmpdir, "source", "images"),
+            )
+            for index, root in enumerate(roots, start=1):
+                os.makedirs(root)
+                with open(os.path.join(root, f"case{index}.nii.gz"), "wb") as f:
+                    f.write(f"image-{index}".encode())
+            with open(os.path.join(tmpdir, "case3.nii.gz"), "wb") as f:
+                f.write(b"image-3")
+
+            with self.assertRaisesRegex(
+                    ValueError, "multiple populated image roots.*images.*source/images.*root"):
+                scan_images(tmpdir)
+
+    def test_scan_images_does_not_double_count_reserved_dicom_root(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            images = os.path.join(tmpdir, "images")
+            os.makedirs(images)
+            with open(os.path.join(images, "case001.dcm"), "wb") as f:
+                f.write(b"dicom")
+
+            samples = scan_images(tmpdir)
+
+        self.assertEqual([sample["sample_id"] for sample in samples], ["case001"])
+
+    def test_scan_images_keeps_root_dicom_series_named_source(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            series = os.path.join(tmpdir, "source")
+            os.makedirs(series)
+            with open(os.path.join(series, "001.dcm"), "wb") as f:
+                f.write(b"dicom")
+
+            samples = scan_images(tmpdir)
+
+        self.assertEqual([sample["sample_id"] for sample in samples], ["source"])
+
+    def test_scan_masks_rejects_multiple_populated_roots(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            roots = (
+                os.path.join(tmpdir, "masks"),
+                os.path.join(tmpdir, "source", "masks"),
+                os.path.join(tmpdir, "labels"),
+                os.path.join(tmpdir, "source", "labels"),
+            )
+            for index, root in enumerate(roots, start=1):
+                os.makedirs(root)
+                with open(os.path.join(root, f"case{index}_mask.nii.gz"), "wb") as f:
+                    f.write(f"mask-{index}".encode())
+
+            with self.assertRaisesRegex(
+                    ValueError,
+                    "multiple populated mask roots.*masks.*source/masks.*labels.*source/labels"):
+                scan_masks(
+                    tmpdir,
+                    sample_ids=["case1", "case2", "case3", "case4"],
+                )
 
     def test_local_scans_reject_detached_image_and_mask_containers(self):
         cases = (

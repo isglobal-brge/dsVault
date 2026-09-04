@@ -54,6 +54,7 @@ from dsimaging_admin.manifest import (
     validate_dicom_series,
 )
 from dsimaging_admin.hashing import sha256_file
+from dsimaging_admin.resources import build_direct_resource_url
 from dsimaging_admin.s3 import (
     create_client,
     create_sqs_client,
@@ -1382,17 +1383,12 @@ def manifest_modality(s3, bucket: str, prefix: str) -> str:
 
 def resource_block(config: dict, dataset_id: str) -> str:
     endpoint = config.get("endpoint", "")
-    validate_s3_endpoint(endpoint or None)
     bucket = config.get("bucket", "")
     region = config.get("region", "")
-    prefix = f"datasets/{dataset_id}"
-    parameters = {"endpoint": endpoint, "bucket": bucket, "prefix": prefix}
-    if region:
-        parameters["region"] = region
-    query = requests.compat.urlencode(parameters)
     return yaml.safe_dump({
         "name": dataset_id,
-        "url": f"imaging+dataset://{dataset_id}?{query}",
+        "url": build_direct_resource_url(
+            dataset_id, endpoint=endpoint, bucket=bucket, region=region),
         "credentials": {
             "identity": "<configured access key>",
             "secret": "<configured secret key>",

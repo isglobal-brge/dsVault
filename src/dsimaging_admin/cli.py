@@ -26,6 +26,7 @@ from .s3 import (
     detect_backend,
     get_object_bytes,
     head_object,
+    is_loopback_s3_endpoint,
     is_native_aws_s3_endpoint,
     list_datasets,
     list_object_versions,
@@ -50,6 +51,10 @@ from .manifest import (
     validate_dicom_series,
     validate_manifest_scope,
     write_manifest_yaml,
+)
+from .resources import (
+    build_armadillo_resource_plan,
+    build_opal_resource_plan,
 )
 from .store import (
     DEFAULT_CONTROLLER_IMAGE,
@@ -1527,6 +1532,82 @@ def verify_cmd(ctx, dataset_id, sample_fraction, quick, output):
             click.echo(f"  ... {len(result.issues) - 50} more issue(s)")
     if not result.ok:
         sys.exit(2)
+
+
+@dataset_group.command("resource-plan")
+@click.argument("dataset_id")
+@click.option(
+    "--target", required=True, type=click.Choice(["opal", "armadillo"]),
+    help="DataSHIELD resource target",
+)
+@click.option("--project", required=True, help="Target Opal/Armadillo project")
+@click.option("--name", "resource_name", default=None,
+              help="Resource name [default: dataset ID; Armadillo uses underscores]")
+@click.option(
+    "--resource-endpoint", default=None, envvar="DSIMAGING_RESOURCE_ENDPOINT",
+    show_envvar=True,
+    help="S3 URL reachable from the DataSHIELD server",
+)
+@click.option("--armadillo-url", default=None,
+              help="Armadillo base URL (required for Armadillo)")
+@click.option("--credentials-ref", default=None,
+              help="Protected dsImaging credential reference (Armadillo)")
+@click.pass_context
+def resource_plan_cmd(ctx, dataset_id, target, project, resource_name,
+                      resource_endpoint, armadillo_url, credentials_ref):
+    """Print a resource handoff plan; this does not register or write anything."""
+    _validate_dataset_cli(dataset_id)
+    if target == "opal" and (armadillo_url or credentials_ref):
+        raise click.ClickException(
+            "--armadillo-url and --credentials-ref are only valid with "
+            "--target armadillo"
+        )
+    if target == "armadillo" and not (armadillo_url and credentials_ref):
+        raise click.ClickException(
+            "--target armadillo requires --armadillo-url and --credentials-ref"
+        )
+
+    configured_endpoint = ctx.obj.get("endpoint") or ""
+    endpoint = resource_endpoint or configured_endpoint
+    try:
+        validate_s3_endpoint(endpoint or None)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if not resource_endpoint and is_loopback_s3_endpoint(configured_endpoint):
+        raise click.ClickException(
+            "the selected profile uses a loopback S3 endpoint; pass "
+            "--resource-endpoint with the S3 URL reachable from the "
+            "DataSHIELD server"
+        )
+
+    bucket = ctx.obj["bucket"]
+    prefix = f"datasets/{dataset_id}"
+    try:
+        manifest = _read_manifest_strict(_get_s3(ctx), bucket, prefix)
+        common = {
+            "dataset_id": dataset_id,
+            "profile": ctx.obj["profile"],
+            "bucket": bucket,
+            "endpoint": endpoint,
+            "region": ctx.obj.get("region") or "",
+            "project": project,
+            "resource_name": resource_name,
+            "manifest_schema_version": manifest["schema_version"],
+        }
+        if target == "opal":
+            plan = build_opal_resource_plan(**common)
+        else:
+            plan = build_armadillo_resource_plan(
+                **common,
+                armadillo_url=armadillo_url,
+                credentials_ref=credentials_ref,
+            )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    import yaml
+    click.echo(yaml.safe_dump(
+        plan, sort_keys=False, width=1_000_000).rstrip())
 
 
 @dataset_group.command("delete")

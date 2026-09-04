@@ -32,10 +32,13 @@ _RESOURCE_FIELDS = (
 
 def validate_dataset_id(dataset_id: str) -> str:
     """Validate and return a dsimaging dataset identifier."""
-    if not DATASET_ID_RE.fullmatch(dataset_id or ""):
+    if (not isinstance(dataset_id, str) or
+            len(dataset_id.encode("utf-8")) > 128 or
+            not DATASET_ID_RE.fullmatch(dataset_id) or
+            ".." in dataset_id):
         raise ValueError(
-            "dataset_id must match ^[a-z0-9][a-z0-9._-]*$ "
-            "(lowercase letters, digits, dot, underscore and dash)"
+            "dataset_id must match ^[a-z0-9][a-z0-9._-]*$, be at most "
+            "128 bytes, and not contain consecutive dots"
         )
     return dataset_id
 
@@ -839,34 +842,59 @@ def _left_join_metadata(base: pa.Table, extra_metadata: pa.Table) -> pa.Table:
 
 def _find_images_dir(source_dir: str) -> str | None:
     """Find the directory containing image files."""
-    for candidate in ["images", "source/images", "."]:
+    populated = []
+    for candidate, label in (
+        ("images", "images"),
+        ("source/images", "source/images"),
+        (".", "root"),
+    ):
         d = os.path.join(source_dir, candidate)
         if os.path.islink(d):
             raise ValueError("symbolic links are not allowed for the image root")
-        if os.path.isdir(d) and _contains_supported_images(d):
-            return d
-    return None
+        excluded = (
+            {"images", "masks", "labels"}
+            if candidate == "." else set()
+        )
+        if os.path.isdir(d) and _contains_supported_images(
+                d, excluded_directories=excluded):
+            populated.append((label, d))
+    if len(populated) > 1:
+        labels = ", ".join(label for label, _ in populated)
+        raise ValueError(
+            f"multiple populated image roots found: {labels}; keep images under "
+            "exactly one of images/, source/images/, or the dataset root"
+        )
+    return populated[0][1] if populated else None
 
 
 def _find_masks_dir(source_dir: str) -> str | None:
     """Find the directory containing mask files."""
+    populated = []
     for candidate in ["masks", "source/masks", "labels", "source/labels"]:
         d = os.path.join(source_dir, candidate)
         if os.path.islink(d):
             raise ValueError("symbolic links are not allowed for the mask root")
         if os.path.isdir(d) and _contains_supported_masks(d):
-            return d
-    return None
+            populated.append((candidate, d))
+    if len(populated) > 1:
+        labels = ", ".join(label for label, _ in populated)
+        raise ValueError(
+            f"multiple populated mask roots found: {labels}; keep masks under "
+            "exactly one of masks/, source/masks/, labels/, or source/labels/"
+        )
+    return populated[0][1] if populated else None
 
 
-def _contains_supported_images(directory: str) -> bool:
+def _contains_supported_images(
+        directory: str, *, excluded_directories: set[str] | None = None) -> bool:
+    excluded_directories = excluded_directories or set()
     for entry in os.listdir(directory):
         path = os.path.join(directory, entry)
         if os.path.islink(path):
             raise ValueError("symbolic links are not allowed in image collections")
         if os.path.isfile(path) and is_image_file(entry):
             return True
-        if os.path.isdir(path):
+        if os.path.isdir(path) and entry not in excluded_directories:
             if any(f.lower().endswith(".dcm") for f in os.listdir(path)):
                 return True
     return False
